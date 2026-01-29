@@ -4,7 +4,6 @@ A production-ready conversational AI backend built on OpenAI's Conversations API
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)
-![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 ## ✨ Features
@@ -17,7 +16,7 @@ A production-ready conversational AI backend built on OpenAI's Conversations API
 | **Enterprise Storage** | PostgreSQL + S3 for files |
 | **Rate Limiting** | Token bucket algorithm per user |
 | **Cost Tracking** | Real-time token usage and cost calculation |
-| **Health Monitoring** | Kubernetes-ready liveness/readiness probes |
+| **Health Monitoring** | Liveness/readiness probes |
 | **Streaming** | Server-Sent Events for real-time responses |
 
 ## 🏗️ Architecture
@@ -49,31 +48,17 @@ A production-ready conversational AI backend built on OpenAI's Conversations API
 
 ## 🚀 Quick Start
 
-### Option 1: Docker (Recommended)
-
 ```bash
 # Clone the repository
 git clone https://github.com/arjunthilakeros/LLM_Wrapper.git
 cd LLM_Wrapper
 
-# Copy environment file
-cp .env.example .env
-
-# Add your OpenAI API key
-echo "OPENAI_API_KEY=sk-your-key-here" >> .env
-
-# Run with Docker
-docker-compose up --build
-```
-
-### Option 2: Local Development
-
-```bash
 # Install dependencies
 pip install -r requirements.txt
 
-# Set environment variables
-export OPENAI_API_KEY=sk-your-key-here
+# Copy environment file and add your API key
+cp .env.example .env
+# Edit .env and add: OPENAI_API_KEY=sk-your-key-here
 
 # Run the server
 python server.py
@@ -160,8 +145,6 @@ LLM_Wrapper/
 ├── validators.py       # Input validation
 ├── config.yaml         # Application config
 ├── prompts.yaml        # System prompts
-├── Dockerfile          # Container image
-├── docker-compose.yml  # Docker orchestration
 └── requirements.txt    # Python dependencies
 ```
 
@@ -174,22 +157,6 @@ LLM_Wrapper/
 | File upload (10MB) | < 3s |
 | Health check | < 100ms |
 
-## 🐳 Docker Commands
-
-```bash
-# Start all services
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# Stop all services
-docker-compose down
-
-# Rebuild after changes
-docker-compose up --build
-```
-
 ## 💰 Cost Estimation
 
 | Usage Pattern | Tokens/Month | Cost/Month |
@@ -201,11 +168,13 @@ docker-compose up --build
 ## 🧪 Testing
 
 ```bash
-# Run the test script
-python test_production_capabilities.py
-
 # Health check
 curl http://localhost:8000/health
+
+# Test chat
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Hello!"}'
 ```
 
 ## 📚 Documentation
