@@ -1,0 +1,44 @@
+# Terminal Chatbot Configuration
+
+# Model Settings
+model: gpt-4o
+
+# Conversation Settings
+max_history_items: 100
+
+# Rate Limiting
+rate_limit_per_minute: 10
+max_input_length: 10000
+
+# File Upload Settings
+max_file_size_mb: 20
+max_document_chars: 50000
+
+# Cost Control (USD)
+cost_limit_per_session: 5.0
+warn_at_cost: 1.0
+
+# Token Pricing (per 1K tokens) - GPT-4o as of 2025
+pricing:
+  input_per_1k: 0.0025
+  output_per_1k: 0.01
+
+# Storage
+data_dir: ./data
+export_dir: ./exports
+upload_dir: ./uploads
+
+# Display
+show_tokens: true
+show_cost: true
+stream_responses: true
+
+# Logging
+logging:
+  level: INFO
+  log_to_file: true
+  log_dir: ./logs
+
+# API Settings
+api_timeout: 30
+api_max_retries: 3
