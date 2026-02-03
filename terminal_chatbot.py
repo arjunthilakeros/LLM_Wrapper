@@ -1,6 +1,6 @@
 """
-Production-Ready Terminal Chatbot
-OpenAI Conversations API + Token Tracking + Auto-Summarization + File Upload
+Production-Ready Terminal Chatbot - OpenAI-Compatible API Version
+Unified /chat endpoint with multimodal support (text, images, documents)
 With PostgreSQL database and S3 storage support.
 
 Requires: pip install openai>=1.50.0 pyyaml tenacity psycopg2-binary boto3 python-dotenv
@@ -18,6 +18,7 @@ import base64
 import mimetypes
 from datetime import datetime
 from pathlib import Path
+from typing import List, Dict, Union, Optional, Any
 
 # Load environment variables from .env file
 try:
@@ -119,7 +120,9 @@ def load_config() -> dict:
         "stream_responses": True,
         "logging": {"level": "INFO", "log_to_file": True, "log_dir": "./logs"},
         "api_timeout": 30,
-        "api_max_retries": 3
+        "api_max_retries": 3,
+        "temperature": 1.0,
+        "max_tokens": None
     }
 
     if config_path.exists():
@@ -135,7 +138,7 @@ def load_prompts() -> dict:
     prompts_path = BASE_DIR / "prompts.yaml"
     default_prompts = {
         "system_prompt": "You are a helpful AI assistant. Be concise and helpful.",
-        "welcome_message": "Terminal Chatbot",
+        "welcome_message": "Terminal Chatbot - OpenAI-Compatible API",
         "custom_prompts": {}
     }
 
@@ -177,7 +180,7 @@ if DATABASE_AVAILABLE and DATABASE_ENABLED:
 
 
 class FileHandler:
-    """Handle file uploads - images and documents"""
+    """Handle file uploads - images and documents with OpenAI-compatible format"""
 
     @staticmethod
     def get_file_type(filepath: Path) -> str:
@@ -220,7 +223,7 @@ class FileHandler:
 
     @staticmethod
     def read_image(filepath: Path) -> dict:
-        """Read image and encode as base64"""
+        """Read image and encode as base64, return OpenAI-compatible format"""
         mime_type, _ = mimetypes.guess_type(str(filepath))
         if not mime_type:
             mime_type = "image/jpeg"
@@ -228,17 +231,20 @@ class FileHandler:
         with open(filepath, "rb") as f:
             image_data = base64.b64encode(f.read()).decode("utf-8")
 
+        # Return OpenAI-compatible image_url content part
         return {
-            "type": "image",
-            "mime_type": mime_type,
-            "data": image_data,
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime_type};base64,{image_data}",
+                "detail": "auto"
+            },
             "filename": filepath.name,
             "size_kb": filepath.stat().st_size / 1024
         }
 
     @staticmethod
     def read_document(filepath: Path) -> dict:
-        """Read text document"""
+        """Read text document, return OpenAI-compatible text format"""
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -246,16 +252,17 @@ class FileHandler:
             with open(filepath, "r", encoding="latin-1") as f:
                 content = f.read()
 
+        # Return OpenAI-compatible text content part
         return {
-            "type": "document",
-            "content": content,
+            "type": "text",
+            "text": f"[Document: {filepath.name}]\n```\n{content}\n```",
             "filename": filepath.name,
             "size_kb": filepath.stat().st_size / 1024
         }
 
     @staticmethod
     def read_pdf(filepath: Path) -> dict:
-        """Read PDF document"""
+        """Read PDF document, return OpenAI-compatible text format"""
         if not PDF_SUPPORT:
             return {"type": "error", "message": "PDF support not installed"}
 
@@ -266,9 +273,12 @@ class FileHandler:
                 text_parts.append(page.extract_text())
                 text_parts.append("\n")
 
+        content = "".join(text_parts)
+        
+        # Return OpenAI-compatible text content part
         return {
-            "type": "document",
-            "content": "".join(text_parts),
+            "type": "text",
+            "text": f"[PDF Document: {filepath.name}]\n```\n{content}\n```",
             "filename": filepath.name,
             "pages": len(reader.pages),
             "size_kb": filepath.stat().st_size / 1024
@@ -276,23 +286,24 @@ class FileHandler:
 
     @staticmethod
     def read_docx(filepath: Path) -> dict:
-        """Read DOCX document"""
+        """Read DOCX document, return OpenAI-compatible text format"""
         if not DOCX_SUPPORT:
             return {"type": "error", "message": "DOCX support not installed"}
 
         doc = docx.Document(filepath)
         content = "\n".join([para.text for para in doc.paragraphs])
 
+        # Return OpenAI-compatible text content part
         return {
-            "type": "document",
-            "content": content,
+            "type": "text",
+            "text": f"[DOCX Document: {filepath.name}]\n```\n{content}\n```",
             "filename": filepath.name,
             "size_kb": filepath.stat().st_size / 1024
         }
 
     @staticmethod
     def process_file(filepath: Path) -> dict:
-        """Process any supported file"""
+        """Process any supported file and return OpenAI-compatible content part"""
         file_type = FileHandler.get_file_type(filepath)
 
         if file_type == "image":
@@ -308,7 +319,7 @@ class FileHandler:
 
 
 class ConversationManager:
-    """Production-ready conversation manager with database support"""
+    """Production-ready conversation manager with OpenAI-compatible API"""
 
     def __init__(self, user_id: str = None):
         self.client = create_openai_client(
@@ -327,6 +338,9 @@ class ConversationManager:
         self.conversations_list = []
         self.pending_files = []
         self._should_shutdown = False
+        
+        # Message history for OpenAI-compatible API
+        self.messages: List[Dict[str, Any]] = []
 
         # Database reference
         self.db = db
@@ -502,30 +516,36 @@ class ConversationManager:
             ) from e
 
     def create_conversation(self) -> str:
-        conv = self._execute_with_retry(
-            self.client.conversations.create,
-            metadata={
-                "app": "terminal_chatbot",
-                "user_id": self.user_id,
-                "created_at": datetime.now().isoformat()
-            }
-        )
-        self.conversation_id = conv.id
+        """Create a new conversation (using OpenAI-compatible format with conversation tracking)."""
+        # Generate a conversation ID for tracking
+        conv_id = f"conv_{uuid.uuid4().hex[:16]}"
+        self.conversation_id = conv_id
         self.message_count = 0
+        
+        # Reset message history
+        self.messages = []
+        
+        # Add system prompt if configured
+        system_prompt = PROMPTS.get("system_prompt")
+        if system_prompt:
+            self.messages.append({
+                "role": "system",
+                "content": system_prompt
+            })
 
         # Save to database or local list
         if self.use_database and self.db:
             try:
                 self.db.create_conversation(
-                    conversation_id=conv.id,
+                    conversation_id=conv_id,
                     user_id=self.user_id,
-                    metadata={"app": "terminal_chatbot"}
+                    metadata={"app": "terminal_chatbot", "api_version": "openai-compatible"}
                 )
             except Exception as e:
                 logger.error(f"Failed to save conversation to database: {e}")
 
         self.conversations_list.append({
-            "id": conv.id,
+            "id": conv_id,
             "created_at": datetime.now().isoformat(),
             "message_count": 0
         })
@@ -533,10 +553,11 @@ class ConversationManager:
         if not self.use_database:
             self._save_conversations_list()
 
-        logger.info(f"Created new conversation: {conv.id}")
-        return conv.id
+        logger.info(f"Created new conversation: {conv_id}")
+        return conv_id
 
     def upload_file(self, filepath: str) -> dict:
+        """Upload a file and store as OpenAI-compatible content part."""
         try:
             path, warnings = validate_file_path(filepath)
             for warning in warnings:
@@ -556,278 +577,74 @@ class ConversationManager:
             return {"success": False, "error": file_data["message"]}
 
         self.pending_files.append(file_data)
-        logger.info(f"File uploaded: {file_data['filename']} ({file_data.get('size_kb', 0):.1f}KB)")
+        logger.info(f"File uploaded: {file_data.get('filename', 'unknown')} ({file_data.get('size_kb', 0):.1f}KB)")
         return {
             "success": True,
-            "filename": file_data["filename"],
-            "type": file_data["type"],
+            "filename": file_data.get("filename", "unknown"),
+            "type": file_data.get("type", "unknown"),
             "size_kb": file_data.get("size_kb", 0),
             "pending_count": len(self.pending_files)
         }
 
-    def _build_input_with_file(self, message: str):
+    def _build_messages(self, user_message: str) -> List[Dict[str, Any]]:
+        """Build OpenAI-compatible messages array with pending files."""
         if not self.pending_files:
-            return message, False
+            # Simple text message
+            self.messages.append({
+                "role": "user",
+                "content": user_message
+            })
+            return self.messages.copy()
 
-        # Only process if we have images (since /chat/image handles multiple images)
-        # Check if we have any images
-        images = [f for f in self.pending_files if f["type"] == "image"]
+        # Build multimodal content
+        content_parts = [{"type": "text", "text": user_message}]
         
-        # If we have images, we treat this as a vision request
-        if images:
-            content_blocks = [{"type": "input_text", "text": message}]
+        for file_data in self.pending_files:
+            file_type = file_data.get("type")
             
-            for img in images:
-                content_blocks.append({
-                    "type": "input_image",
-                    "image_url": f"data:{img['mime_type']};base64,{img['data']}"
+            if file_type == "image_url":
+                # Add image content part
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": file_data.get("image_url", {})
                 })
-                
-            image_content = [
-                {
-                    "role": "user",
-                    "content": content_blocks
-                }
-            ]
-            
-            # Clear pending files after building input (assuming it will be sent)
-            # Actually, `chat` calls this. If it fails, files are lost. 
-            # But standard pattern is to clear after use. 
-            self.pending_files = []
-            return image_content, True
-            
-        # Fallback for non-image files (PDF/DOCX) - currently taking the last one for text extraction
-        # or concatenating? Let's concatenate if multiple documents.
-        combined_text = []
-        for f in self.pending_files:
-             if "content" in f:
-                 doc_content = f["content"]
-                 if len(doc_content) > 50000:
-                     doc_content = doc_content[:50000] + "\n\n[... truncated ...]"
-                 combined_text.append(f"[File: {f['filename']}]\n```\n{doc_content}\n```")
+            elif file_type == "text":
+                # Add document text as a separate content part
+                content_parts.append({
+                    "type": "text",
+                    "text": f"\n\n{file_data.get('text', '')}"
+                })
         
+        # Clear pending files after building input
         self.pending_files = []
-        if combined_text:
-            return "\n\n".join(combined_text) + f"\n\n{message}", False
-            
-        return message, False
-
-
-    def _chat_with_image(self, image_content: list) -> dict:
-        vision_model = CONFIG["model"]
-        if vision_model == "gpt-4":
-            vision_model = "gpt-4o"
-
-        if not self.conversation_id:
-            self.create_conversation()
-
-        response = self._execute_with_retry(
-            self.client.responses.create,
-            model=vision_model,
-            input=image_content,
-            conversation=self.conversation_id,
-            instructions=PROMPTS["system_prompt"]
-        )
-
-        usage = self._extract_usage(response)
-
-        return {"text": response.output_text, "usage": usage}
-
-    def _chat_with_image_stream(self, image_content: list):
-        vision_model = CONFIG["model"]
-        if vision_model == "gpt-4":
-            vision_model = "gpt-4o"
-
-        if not self.conversation_id:
-            self.create_conversation()
-
-        stream = self._execute_with_retry(
-            self.client.responses.create,
-            model=vision_model,
-            input=image_content,
-            conversation=self.conversation_id,
-            instructions=PROMPTS["system_prompt"],
-            stream=True
-        )
-
-        text_parts = []
-        usage = {"input": 0, "output": 0, "total": 0}
-
-        for event in stream:
-            if hasattr(event, 'type'):
-                if event.type == 'response.output_text.delta':
-                    delta = getattr(event, 'delta', '')
-                    print(delta, end='', flush=True)
-                    text_parts.append(delta)
-                    yield delta
-                elif event.type == 'response.completed':
-                    if hasattr(event, 'response') and hasattr(event.response, 'usage'):
-                        resp_usage = event.response.usage
-                        usage = {
-                            "input": getattr(resp_usage, 'input_tokens', 0),
-                            "output": getattr(resp_usage, 'output_tokens', 0),
-                            "total": getattr(resp_usage, 'total_tokens', 0)
-                        }
-
-        self._last_stream_usage = usage
-        return "".join(text_parts)
-
-    def chat(self, message: str) -> dict:
-        self._check_cost_limit()
-        self._check_rate_limit()
-
-        try:
-            message, warnings = sanitize_input(
-                message,
-                max_length=CONFIG.get("max_input_length", 10000)
-            )
-            for warning in warnings:
-                logger.warning(f"Input sanitization: {warning}")
-                print(f"[Warning: {warning}]")
-        except ValidationError as e:
-            logger.error(f"Input validation failed: {e}")
-            raise
-
-        if not self.conversation_id:
-            self.create_conversation()
-
-        input_data, is_image = self._build_input_with_file(message)
-
-        if is_image:
-            result = self._chat_with_image(input_data)
-            usage = result["usage"]
-            output_text = result["text"]
-        else:
-            response = self._execute_with_retry(
-                self.client.responses.create,
-                model=CONFIG["model"],
-                input=input_data,
-                conversation=self.conversation_id,
-                instructions=PROMPTS["system_prompt"]
-            )
-            usage = self._extract_usage(response)
-            output_text = response.output_text
-
-        self.message_count += 1
-        self._update_conversation_count()
-        self._update_session_stats(usage)
-
-        logger.debug(f"Chat completed - tokens: {usage}, cost: ${self._calculate_cost(usage):.6f}")
-
-        return {
-            "text": output_text,
-            "usage": usage,
-            "cost": self._calculate_cost(usage),
-            "user_id": self.user_id,
-            "conversation_id": self.conversation_id,
-            "message_number": self.message_count
-        }
-
-    def chat_stream(self, message: str) -> dict:
-        self._check_cost_limit()
-        self._check_rate_limit()
-
-        try:
-            message, warnings = sanitize_input(
-                message,
-                max_length=CONFIG.get("max_input_length", 10000)
-            )
-            for warning in warnings:
-                logger.warning(f"Input sanitization: {warning}")
-                print(f"[Warning: {warning}]")
-        except ValidationError as e:
-            logger.error(f"Input validation failed: {e}")
-            raise
-
-        if not self.conversation_id:
-            self.create_conversation()
-
-        input_data, is_image = self._build_input_with_file(message)
-
-        self.message_count += 1
-        self._update_conversation_count()
-
-        if is_image:
-            text_parts = []
-            for delta in self._chat_with_image_stream(input_data):
-                text_parts.append(delta)
-
-            full_text = "".join(text_parts)
-            usage = getattr(self, '_last_stream_usage', {"input": 0, "output": 0, "total": 0})
-            self._update_session_stats(usage)
-
-            return {
-                "text": full_text,
-                "usage": usage,
-                "cost": self._calculate_cost(usage),
-                "user_id": self.user_id,
-                "conversation_id": self.conversation_id,
-                "message_number": self.message_count
-            }
-
-        stream = self._execute_with_retry(
-            self.client.responses.create,
-            model=CONFIG["model"],
-            input=input_data,
-            conversation=self.conversation_id,
-            instructions=PROMPTS["system_prompt"],
-            stream=True
-        )
-
-        text_parts = []
-        usage = {"input": 0, "output": 0, "total": 0}
-
-        for event in stream:
-            if hasattr(event, 'type'):
-                if event.type == 'response.output_text.delta':
-                    delta = getattr(event, 'delta', '')
-                    print(delta, end='', flush=True)
-                    text_parts.append(delta)
-                elif event.type == 'response.completed':
-                    if hasattr(event, 'response') and hasattr(event.response, 'usage'):
-                        resp_usage = event.response.usage
-                        usage = {
-                            "input": getattr(resp_usage, 'input_tokens', 0),
-                            "output": getattr(resp_usage, 'output_tokens', 0),
-                            "total": getattr(resp_usage, 'total_tokens', 0)
-                        }
-
-        full_text = "".join(text_parts)
-        self._update_session_stats(usage)
-
-        logger.debug(f"Stream completed - tokens: {usage}, cost: ${self._calculate_cost(usage):.6f}")
-
-        return {
-            "text": full_text,
-            "usage": usage,
-            "cost": self._calculate_cost(usage),
-            "user_id": self.user_id,
-            "conversation_id": self.conversation_id,
-            "message_number": self.message_count
-        }
-
-    def chat_with_image(self, message: str, image_path: str) -> dict:
-        result = self.upload_file(image_path)
-        if not result["success"]:
-            return {"text": f"Upload failed: {result['error']}", "usage": {}, "error": True}
-        return self.chat(message)
+        
+        self.messages.append({
+            "role": "user",
+            "content": content_parts
+        })
+        
+        return self.messages.copy()
 
     def _extract_usage(self, response) -> dict:
+        """Extract token usage from OpenAI-compatible response."""
         if not response.usage:
             return {"input": 0, "output": 0, "total": 0}
+        # OpenAI-compatible format: prompt_tokens, completion_tokens
         return {
-            "input": getattr(response.usage, 'input_tokens', 0),
-            "output": getattr(response.usage, 'output_tokens', 0),
+            "input": getattr(response.usage, 'prompt_tokens', 0),
+            "output": getattr(response.usage, 'completion_tokens', 0),
             "total": getattr(response.usage, 'total_tokens', 0)
         }
 
     def _calculate_cost(self, usage: dict) -> float:
+        """Calculate cost based on token usage."""
         pricing = CONFIG["pricing"]
         input_cost = (usage.get("input", 0) / 1000) * pricing["input_per_1k"]
         output_cost = (usage.get("output", 0) / 1000) * pricing["output_per_1k"]
         return round(input_cost + output_cost, 6)
 
     def _update_session_stats(self, usage: dict):
+        """Update session token and cost statistics."""
         self.session_tokens["input"] += usage.get("input", 0)
         self.session_tokens["output"] += usage.get("output", 0)
         self.session_tokens["total"] += usage.get("total", 0)
@@ -849,6 +666,7 @@ class ConversationManager:
             print(f"\n[Warning: Session cost ${self.session_cost:.4f}]")
 
     def _update_conversation_count(self):
+        """Update conversation message count."""
         for conv in self.conversations_list:
             if conv["id"] == self.conversation_id:
                 conv["message_count"] = self.message_count
@@ -866,63 +684,243 @@ class ConversationManager:
         else:
             self._save_conversations_list()
 
-    def get_history(self) -> list:
-        if not self.conversation_id:
-            return []
+    def _add_assistant_message(self, content: str):
+        """Add assistant message to conversation history."""
+        self.messages.append({
+            "role": "assistant",
+            "content": content
+        })
+
+    def chat(self, message: str) -> dict:
+        """Send a chat message using OpenAI-compatible format."""
+        self._check_cost_limit()
+        self._check_rate_limit()
 
         try:
-            items = self._execute_with_retry(
-                self.client.conversations.items.list,
-                conversation_id=self.conversation_id,
-                limit=CONFIG["max_history_items"],
-                order="asc"
+            message, warnings = sanitize_input(
+                message,
+                max_length=CONFIG.get("max_input_length", 10000)
             )
+            for warning in warnings:
+                logger.warning(f"Input sanitization: {warning}")
+                print(f"[Warning: {warning}]")
+        except ValidationError as e:
+            logger.error(f"Input validation failed: {e}")
+            raise
 
-            messages = []
-            for item in items.data:
-                if item.type == "message":
-                    content = getattr(item.content[0], 'text', '') if item.content else ''
-                    messages.append({"role": item.role, "content": content})
-            return messages
-        except ChatbotAPIError as e:
-            logger.error(f"Failed to get history: {e}", exc_info=True)
-            print(f"History error: {e}")
-            return []
-        except (APIConnectionError, RateLimitError, APITimeoutError, APIError) as e:
-            logger.error(f"API error getting history: {e}", exc_info=True)
-            print(f"History error: {e}")
-            return []
+        if not self.conversation_id:
+            self.create_conversation()
+
+        # Build messages array with any pending files
+        messages = self._build_messages(message)
+
+        # Make OpenAI-compatible API call
+        response = self._execute_with_retry(
+            self.client.chat.completions.create,
+            model=CONFIG["model"],
+            messages=messages,
+            temperature=CONFIG.get("temperature", 1.0),
+            max_tokens=CONFIG.get("max_tokens"),
+            user=self.user_id
+        )
+
+        # Extract response using OpenAI-compatible format
+        output_text = response.choices[0].message.content
+        usage = self._extract_usage(response)
+
+        # Add assistant response to conversation history
+        self._add_assistant_message(output_text)
+
+        self.message_count += 1
+        self._update_conversation_count()
+        self._update_session_stats(usage)
+
+        logger.debug(f"Chat completed - tokens: {usage}, cost: ${self._calculate_cost(usage):.6f}")
+
+        return {
+            "text": output_text,
+            "usage": usage,
+            "cost": self._calculate_cost(usage),
+            "user_id": self.user_id,
+            "conversation_id": self.conversation_id,
+            "message_number": self.message_count
+        }
+
+    def chat_stream(self, message: str) -> dict:
+        """Send a chat message with streaming using OpenAI-compatible format."""
+        self._check_cost_limit()
+        self._check_rate_limit()
+
+        try:
+            message, warnings = sanitize_input(
+                message,
+                max_length=CONFIG.get("max_input_length", 10000)
+            )
+            for warning in warnings:
+                logger.warning(f"Input sanitization: {warning}")
+                print(f"[Warning: {warning}]")
+        except ValidationError as e:
+            logger.error(f"Input validation failed: {e}")
+            raise
+
+        if not self.conversation_id:
+            self.create_conversation()
+
+        # Build messages array with any pending files
+        messages = self._build_messages(message)
+
+        self.message_count += 1
+        self._update_conversation_count()
+
+        # Make OpenAI-compatible streaming API call
+        stream = self._execute_with_retry(
+            self.client.chat.completions.create,
+            model=CONFIG["model"],
+            messages=messages,
+            temperature=CONFIG.get("temperature", 1.0),
+            max_tokens=CONFIG.get("max_tokens"),
+            user=self.user_id,
+            stream=True,
+            stream_options={"include_usage": True}
+        )
+
+        text_parts = []
+        usage = {"input": 0, "output": 0, "total": 0}
+
+        for chunk in stream:
+            # OpenAI-compatible streaming format
+            if chunk.choices and len(chunk.choices) > 0:
+                delta = chunk.choices[0].delta
+
+                # Handle content delta
+                if delta and delta.content:
+                    print(delta.content, end='', flush=True)
+                    text_parts.append(delta.content)
+
+            # Usage arrives in a final chunk (with include_usage=True)
+            if hasattr(chunk, 'usage') and chunk.usage:
+                usage = self._extract_usage(chunk)
+
+        full_text = "".join(text_parts)
+        
+        # Add assistant response to conversation history
+        self._add_assistant_message(full_text)
+
+        self._update_session_stats(usage)
+
+        logger.debug(f"Stream completed - tokens: {usage}, cost: ${self._calculate_cost(usage):.6f}")
+
+        return {
+            "text": full_text,
+            "usage": usage,
+            "cost": self._calculate_cost(usage),
+            "user_id": self.user_id,
+            "conversation_id": self.conversation_id,
+            "message_number": self.message_count
+        }
+
+    def chat_with_image(self, message: str, image_path: str) -> dict:
+        """Send a message with an image."""
+        result = self.upload_file(image_path)
+        if not result["success"]:
+            return {"text": f"Upload failed: {result['error']}", "usage": {}, "error": True}
+        return self.chat(message)
+
+    def get_history(self) -> list:
+        """Get conversation history from local messages array."""
+        # Return messages in a user-friendly format
+        history = []
+        for msg in self.messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            
+            # Handle different content types
+            if isinstance(content, list):
+                # Multimodal content - extract text parts
+                text_parts = []
+                for part in content:
+                    if part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif part.get("type") == "image_url":
+                        text_parts.append("[Image]")
+                content = " ".join(text_parts)
+            
+            if role in ["user", "assistant"]:
+                history.append({"role": role, "content": content or ""})
+        
+        return history
 
     def list_saved_conversations(self) -> list:
+        """List saved conversations."""
         if self.use_database and self.db:
             self._load_conversations_from_db()
         return self.conversations_list
 
     def load_conversation(self, conv_id: str) -> bool:
-        try:
-            validate_conversation_id(conv_id)
-        except ValidationError as e:
-            logger.warning(f"Invalid conversation ID: {e}")
-            return False
+        """Load a conversation by ID (supports partial ID matching)."""
+        conv_id = conv_id.strip()
 
         try:
-            items = self._execute_with_retry(
-                self.client.conversations.items.list,
-                conversation_id=conv_id,
-                limit=100
-            )
-            self.conversation_id = conv_id
-            self.message_count = len([i for i in items.data if i.type == "message"]) // 2
-            logger.info(f"Loaded conversation: {conv_id}")
-            return True
-        except ChatbotAPIError as e:
-            logger.error(f"Failed to load conversation: {e}", exc_info=True)
+            if self.use_database and self.db:
+                # Try exact match first
+                conv_data = self.db.get_conversation(conv_id)
+                if not conv_data:
+                    # Try partial match against user's conversations
+                    all_convs = self.db.list_conversations(self.user_id)
+                    matches = [c for c in all_convs if c["id"].startswith(conv_id)]
+                    if len(matches) == 1:
+                        conv_data = matches[0]
+                    elif len(matches) > 1:
+                        logger.warning(f"Ambiguous conversation ID '{conv_id}', {len(matches)} matches")
+                        return False
+
+                if conv_data and conv_data.get("user_id") == self.user_id:
+                    self.conversation_id = conv_data["id"]
+                    self.message_count = conv_data.get("message_count", 0)
+
+                    # Reset messages and rebuild from stored data if available
+                    self.messages = []
+                    system_prompt = PROMPTS.get("system_prompt")
+                    if system_prompt:
+                        self.messages.append({
+                            "role": "system",
+                            "content": system_prompt
+                        })
+
+                    logger.info(f"Loaded conversation: {self.conversation_id}")
+                    return True
+            else:
+                # Check in local conversations list (exact or partial)
+                matches = [c for c in self.conversations_list if c["id"] == conv_id or c["id"].startswith(conv_id)]
+                if len(matches) == 1:
+                    conv = matches[0]
+                    self.conversation_id = conv["id"]
+                    self.message_count = conv.get("message_count", 0)
+
+                    # Reset messages
+                    self.messages = []
+                    system_prompt = PROMPTS.get("system_prompt")
+                    if system_prompt:
+                        self.messages.append({
+                            "role": "system",
+                            "content": system_prompt
+                        })
+
+                    logger.info(f"Loaded conversation: {self.conversation_id}")
+                    return True
+                elif len(matches) > 1:
+                    logger.warning(f"Ambiguous conversation ID '{conv_id}', {len(matches)} matches")
+                    return False
+
+            logger.warning(f"Conversation not found: {conv_id}")
             return False
-        except (APIConnectionError, RateLimitError, APITimeoutError, APIError) as e:
-            logger.error(f"API error loading conversation: {e}", exc_info=True)
+            
+        except Exception as e:
+            logger.error(f"Failed to load conversation: {e}", exc_info=True)
             return False
 
     def export_conversation(self, format: str = "txt") -> str:
+        """Export conversation to a file."""
         history = self.get_history()
         if not history:
             return None
@@ -955,7 +953,8 @@ class ConversationManager:
                     "conversation_id": self.conversation_id,
                     "user_id": self.user_id,
                     "exported_at": datetime.now().isoformat(),
-                    "messages": history
+                    "messages": history,
+                    "api_version": "openai-compatible"
                 }
                 with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
                     temp_fd = None
@@ -966,7 +965,8 @@ class ConversationManager:
                     temp_fd = None
                     f.write(f"# Conversation Export\n\n")
                     f.write(f"- **ID:** {self.conversation_id}\n")
-                    f.write(f"- **User:** {self.user_id}\n\n---\n\n")
+                    f.write(f"- **User:** {self.user_id}\n")
+                    f.write(f"- **API:** OpenAI-Compatible\n\n---\n\n")
                     for msg in history:
                         role = "**You**" if msg["role"] == "user" else "**AI**"
                         f.write(f"{role}:\n\n{msg['content']}\n\n---\n\n")
@@ -1005,6 +1005,7 @@ class ConversationManager:
 
 
 def print_usage(result: dict):
+    """Print usage statistics."""
     u = result.get("usage", {})
     cost = result.get("cost", 0)
 
@@ -1016,6 +1017,23 @@ def print_usage(result: dict):
     print(f"User: {result['user_id']} | Conv: {result['conversation_id'][:16]}...")
     print(f"Message: #{result['message_number']}")
     print(f"{'─' * 55}\n")
+
+
+def _parse_path_and_message(text: str) -> tuple:
+    """Parse a quoted or unquoted file path and optional message from input text."""
+    text = text.strip()
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        if end != -1:
+            return text[1:end], text[end+1:].strip()
+        return text.strip('"'), ""
+    if text.startswith("'"):
+        end = text.find("'", 1)
+        if end != -1:
+            return text[1:end], text[end+1:].strip()
+        return text.strip("'"), ""
+    parts = text.split(maxsplit=1)
+    return parts[0], parts[1] if len(parts) > 1 else ""
 
 
 def main():
@@ -1058,6 +1076,7 @@ def main():
     # Show storage status
     storage_type = "PostgreSQL" if (DATABASE_AVAILABLE and DATABASE_ENABLED and db) else "JSON files"
     print(f"\nStorage: {storage_type}")
+    print(f"API: OpenAI-Compatible /chat endpoint")
     print()
 
     manager = ConversationManager(user_id=user_id)
@@ -1070,7 +1089,7 @@ def main():
             if manager.pending_files:
                 print(f"[Pending Files: {len(manager.pending_files)}]")
                 for i, pf in enumerate(manager.pending_files, 1):
-                    print(f"  {i}. {pf['filename']} ({pf['type']})")
+                    print(f"  {i}. {pf.get('filename', 'unknown')} ({pf.get('type', 'unknown')})")
 
             user_input = input("You: ").strip()
             if not user_input:
@@ -1082,7 +1101,7 @@ def main():
                 break
 
             elif user_input == "/new":
-                manager.pending_file = None
+                manager.pending_files = []
                 print(f"\nNew: {manager.create_conversation()}\n")
 
             elif user_input == "/id":
@@ -1117,7 +1136,7 @@ def main():
                 convs = manager.list_saved_conversations()
                 print(f"\nConversations ({len(convs)}):")
                 for c in convs[-10:]:
-                    print(f"  {c['id'][:16]}... ({c.get('message_count', '?')} msgs)")
+                    print(f"  {c['id']} ({c.get('message_count', '?')} msgs)")
                 print()
 
             elif user_input.startswith("/load "):
@@ -1128,7 +1147,7 @@ def main():
                     print(f"\nFailed: {conv_id}\n")
 
             elif user_input.startswith("/upload "):
-                filepath = user_input[8:].strip().strip('"').strip("'")
+                filepath, _ = _parse_path_and_message(user_input[8:].strip())
                 result = manager.upload_file(filepath)
                 if result["success"]:
                     print(f"\nUploaded: {result['filename']} ({result['size_kb']:.1f}KB)")
@@ -1137,12 +1156,10 @@ def main():
                     print(f"\nError: {result['error']}\n")
 
             elif user_input.startswith("/image "):
-                parts = user_input[7:].strip().split(maxsplit=1)
-                if len(parts) < 2:
+                filepath, message = _parse_path_and_message(user_input[7:].strip())
+                if not message:
                     print("\nUsage: /image <path> <message>\n")
                     continue
-
-                filepath, message = parts[0].strip('"').strip("'"), parts[1]
                 result = manager.upload_file(filepath)
                 if not result["success"]:
                     print(f"\nError: {result['error']}\n")

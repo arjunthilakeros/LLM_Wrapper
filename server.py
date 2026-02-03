@@ -1,20 +1,25 @@
 """
-FastAPI Server for Terminal Chatbot
+FastAPI Server for Terminal Chatbot - Unified OpenAI-Compatible API
 REST API with PostgreSQL database and S3 storage integration.
+
+Migration: Unified /chat endpoint supporting text, streaming, images, and files
 """
 
 import os
 import uuid
 import base64
 import json
+import time
+import io
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Union, Literal, Any
 from contextlib import asynccontextmanager
+from enum import Enum
 
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Load environment variables
 try:
@@ -71,6 +76,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 
+
 def load_config() -> dict:
     config_path = BASE_DIR / "config.yaml"
     default_config = {
@@ -91,6 +97,7 @@ def load_config() -> dict:
             default_config.update(user_config)
     return default_config
 
+
 def load_prompts() -> dict:
     prompts_path = BASE_DIR / "prompts.yaml"
     default_prompts = {
@@ -101,6 +108,7 @@ def load_prompts() -> dict:
             user_prompts = yaml.safe_load(f) or {}
             default_prompts.update(user_prompts)
     return default_prompts
+
 
 CONFIG = validate_config(load_config())
 PROMPTS = load_prompts()
@@ -121,32 +129,179 @@ rate_limiters: dict = {}  # Per-user rate limiters
 
 
 # =============================================================================
-# Pydantic Models
+# OpenAI-Compatible Pydantic Models
 # =============================================================================
 
+class MessageRole(str, Enum):
+    """Message roles for chat completions."""
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+
+
+class TextContent(BaseModel):
+    """Text content part for multimodal messages."""
+    type: Literal["text"] = "text"
+    text: str
+
+
+class ImageUrlDetail(str, Enum):
+    """Image detail levels."""
+    AUTO = "auto"
+    LOW = "low"
+    HIGH = "high"
+
+
+class ImageUrlContent(BaseModel):
+    """Image URL content part for multimodal messages."""
+    type: Literal["image_url"] = "image_url"
+    image_url: dict = Field(..., description="Object with 'url' and optional 'detail'")
+    
+    @field_validator('image_url')
+    @classmethod
+    def validate_image_url(cls, v):
+        if not isinstance(v, dict) or 'url' not in v:
+            raise ValueError("image_url must contain 'url' field")
+        return v
+
+
+class FileContent(BaseModel):
+    """File content part for document references."""
+    type: Literal["file"] = "file"
+    file: dict = Field(..., description="Object with 'url' and 'name'")
+
+
+ContentPart = Union[TextContent, ImageUrlContent, FileContent]
+
+
+class ChatMessage(BaseModel):
+    """OpenAI-compatible chat message."""
+    role: MessageRole
+    content: Union[str, List[ContentPart]]
+    name: Optional[str] = None
+    
+    @field_validator('content')
+    @classmethod
+    def validate_content(cls, v):
+        if isinstance(v, list) and len(v) == 0:
+            raise ValueError("Content array cannot be empty")
+        return v
+
+
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=50000)
+    """OpenAI-compatible chat completion request."""
+    model: str = Field(default="gpt-4o", description="Model to use")
+    messages: List[ChatMessage] = Field(..., min_length=1)
+    stream: bool = Field(default=False, description="Enable streaming")
+    temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
+    presence_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
+    frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
+    user_id: Optional[str] = Field(default=None, description="User identifier")
+    conversation_id: Optional[str] = Field(default=None, description="Existing conversation")
+    store: bool = Field(default=True, description="Persist conversation")
+    
+    # TextLLM-specific extensions
+    system_prompt: Optional[str] = Field(default=None, description="Override system prompt")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "Hello!"}
+                ],
+                "stream": False,
+                "temperature": 1.0
+            }
+        }
+
+
+class UsageInfo(BaseModel):
+    """Token usage information."""
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class ChoiceMessage(BaseModel):
+    """Message in a choice."""
+    role: str
+    content: Optional[str] = None
+
+
+class Choice(BaseModel):
+    """Response choice."""
+    index: int
+    message: ChoiceMessage
+    finish_reason: Optional[str] = None  # "stop", "length", "content_filter"
+
+
+class ChatCompletionResponse(BaseModel):
+    """OpenAI-compatible chat completion response."""
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: List[Choice]
+    usage: UsageInfo
+    
+    # TextLLM extensions
     conversation_id: Optional[str] = None
     user_id: Optional[str] = None
-    stream: bool = False
+    cost: Optional[float] = None
 
-class ChatResponse(BaseModel):
-    text: str
-    conversation_id: str
-    user_id: str
-    message_number: int
-    usage: dict
-    cost: float
+
+class DeltaMessage(BaseModel):
+    """Delta message for streaming."""
+    role: Optional[str] = None
+    content: Optional[str] = None
+
+
+class StreamChoice(BaseModel):
+    """Choice in a streaming chunk."""
+    index: int
+    delta: DeltaMessage
+    finish_reason: Optional[str] = None
+
+
+class ChatCompletionStreamResponse(BaseModel):
+    """OpenAI-compatible streaming chunk."""
+    id: str
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: List[StreamChoice]
+    usage: Optional[UsageInfo] = None  # Present in final chunk
+
+
+class ErrorDetail(BaseModel):
+    """OpenAI-compatible error detail."""
+    message: str
+    type: str
+    param: Optional[str] = None
+    code: Optional[str] = None
+
+
+class ErrorResponse(BaseModel):
+    """OpenAI-compatible error response."""
+    error: ErrorDetail
+
 
 class ConversationCreate(BaseModel):
     user_id: str = Field(..., min_length=1, max_length=255)
     metadata: Optional[dict] = None
+
 
 class ConversationResponse(BaseModel):
     id: str
     user_id: str
     created_at: str
     message_count: int
+
 
 class MessageResponse(BaseModel):
     id: str
@@ -157,6 +312,7 @@ class MessageResponse(BaseModel):
     tokens_output: int = 0
     cost: float = 0
 
+
 class FileUploadResponse(BaseModel):
     success: bool
     key: Optional[str] = None
@@ -164,11 +320,13 @@ class FileUploadResponse(BaseModel):
     size: Optional[int] = None
     error: Optional[str] = None
 
+
 class HealthResponse(BaseModel):
     status: str
     timestamp: str
     checks: dict
     uptime: dict
+
 
 class UserStatsResponse(BaseModel):
     total_conversations: int
@@ -176,33 +334,6 @@ class UserStatsResponse(BaseModel):
     total_tokens_input: int
     total_tokens_output: int
     total_cost: float
-
-class ErrorResponse(BaseModel):
-    error: str
-    detail: Optional[str] = None
-    code: Optional[str] = None
-
-
-class ImageChatResponse(BaseModel):
-    text: str
-    conversation_id: str
-    user_id: str
-    message_number: int
-    usage: dict
-    cost: float
-    image_urls: Optional[List[str]] = None  # S3 URLs of uploaded images
-    image_count: int = 1
-
-
-class FileChatResponse(BaseModel):
-    text: str
-    conversation_id: str
-    user_id: str
-    message_number: int
-    usage: dict
-    cost: float
-    file_url: Optional[str] = None  # S3 URL of uploaded file
-    file_type: str  # pdf, docx, txt, etc.
 
 
 class SessionResponse(BaseModel):
@@ -248,15 +379,14 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Database disabled or unavailable, using in-memory storage")
 
-    # Initialize Storage (S3 required for production)
-    if not S3_ENABLED:
-        raise ConfigurationError("S3_ENABLED must be true for production. Set S3_ENABLED=true in environment.")
-
-    if not STORAGE_AVAILABLE:
-        raise ConfigurationError("S3 storage unavailable. Install boto3: pip install boto3")
-
-    storage = S3Storage.initialize()
-    logger.info("S3 storage initialized")
+    # Initialize Storage (optional - required for file uploads)
+    if S3_ENABLED:
+        if not STORAGE_AVAILABLE:
+            raise ConfigurationError("S3 storage unavailable. Install boto3: pip install boto3")
+        storage = S3Storage.initialize()
+        logger.info("S3 storage initialized")
+    else:
+        logger.warning("S3 storage disabled. File uploads will not be available.")
 
     logger.info("API server started successfully")
 
@@ -275,8 +405,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Terminal Chatbot API",
-    description="Production-ready chatbot API with OpenAI, PostgreSQL, and S3 integration",
-    version="1.0.0",
+    description="Production-ready chatbot API with OpenAI, PostgreSQL, and S3 integration. "
+                "OpenAI-compatible /chat endpoint supporting text, streaming, images, and documents.",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -321,7 +452,6 @@ def get_openai():
 # Helper Functions
 # =============================================================================
 
-
 def get_or_create_session(user_id: str) -> Optional[str]:
     """
     Get existing session or create new one for a user.
@@ -356,6 +486,402 @@ def update_session_after_chat(session_id: str, tokens: int, cost: float, increme
         logger.error(f"Failed to update session stats: {e}")
 
 
+def build_chat_messages(
+    messages: List[ChatMessage],
+    system_prompt: Optional[str] = None,
+    file_content_parts: Optional[List[dict]] = None
+) -> List[dict]:
+    """
+    Convert ChatMessage list to OpenAI Chat Completions API messages format.
+    
+    Args:
+        messages: List of chat messages
+        system_prompt: Optional system prompt to prepend
+        file_content_parts: Optional file content parts to include in the last user message
+        
+    Returns:
+        List of message dicts with 'role' and 'content' keys for Chat Completions API
+    """
+    chat_messages = []
+    
+    # Add system message if provided
+    if system_prompt:
+        chat_messages.append({"role": "system", "content": system_prompt})
+    
+    # Process each message
+    for i, msg in enumerate(messages):
+        is_last_message = (i == len(messages) - 1)
+        
+        if isinstance(msg.content, str):
+            # Simple text message
+            content = msg.content
+            
+            # If this is the last user message and we have file content parts, combine them
+            if is_last_message and file_content_parts and msg.role.value == "user":
+                # Build multimodal content array
+                content_parts = [{"type": "text", "text": msg.content}]
+                for part in file_content_parts:
+                    if part.get("type") == "input_image":
+                        content_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": part.get("image_url", "")}
+                        })
+                    elif part.get("type") == "input_file":
+                        # For PDFs and other files, include as text reference
+                        content_parts.append({
+                            "type": "text",
+                            "text": f"[File: {part.get('filename', 'document')}]"
+                        })
+                    elif part.get("type") == "input_text":
+                        content_parts.append({"type": "text", "text": part.get("text", "")})
+                content = content_parts
+            
+            chat_messages.append({"role": msg.role.value, "content": content})
+        else:
+            # Multimodal content (list of ContentPart)
+            content_parts = []
+            for part in msg.content:
+                if part.type == "text":
+                    content_parts.append({"type": "text", "text": part.text})
+                elif part.type == "image_url":
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": part.image_url.get("url", "")}
+                    })
+                elif part.type == "file":
+                    content_parts.append({
+                        "type": "text",
+                        "text": f"[File: {part.file.get('name', 'document')}]"
+                    })
+            
+            # Add file content parts to last user message
+            if is_last_message and file_content_parts and msg.role.value == "user":
+                for part in file_content_parts:
+                    if part.get("type") == "input_image":
+                        content_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": part.get("image_url", "")}
+                        })
+                    elif part.get("type") == "input_text":
+                        content_parts.append({"type": "text", "text": part.get("text", "")})
+            
+            if content_parts:
+                chat_messages.append({"role": msg.role.value, "content": content_parts})
+    
+    return chat_messages
+
+
+def extract_text_from_content(messages: List[ChatMessage]) -> str:
+    """Extract text content from messages for sanitization."""
+    texts = []
+    for msg in messages:
+        if isinstance(msg.content, str):
+            texts.append(msg.content)
+        else:
+            for part in msg.content:
+                if part.type == "text":
+                    texts.append(part.text)
+    return " ".join(texts)
+
+
+def calculate_cost(usage: dict) -> float:
+    """Calculate cost from usage."""
+    pricing = CONFIG.get("pricing", {"input_per_1k": 0.0025, "output_per_1k": 0.01})
+    input_tokens = usage.get("prompt_tokens", 0)
+    output_tokens = usage.get("completion_tokens", 0)
+    return round(
+        (input_tokens / 1000) * pricing["input_per_1k"] +
+        (output_tokens / 1000) * pricing["output_per_1k"],
+        6
+    )
+
+
+def extract_usage(response) -> dict:
+    """Extract usage from OpenAI Chat Completions API response."""
+    if not response.usage:
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    
+    # Chat Completions API uses prompt_tokens, completion_tokens, total_tokens
+    usage = {
+        "prompt_tokens": getattr(response.usage, 'prompt_tokens', 0),
+        "completion_tokens": getattr(response.usage, 'completion_tokens', 0),
+        "total_tokens": getattr(response.usage, 'total_tokens', 0)
+    }
+    
+    return usage
+
+
+async def process_uploaded_files(
+    files: List[UploadFile],
+    user_id: str,
+    message: Optional[str] = None
+) -> tuple[List[dict], List[str], List[str]]:
+    """
+    Process uploaded files and return content parts and S3 URLs.
+    
+    Returns:
+        Tuple of (content_parts, s3_urls, file_types)
+    """
+    if not storage:
+        raise HTTPException(status_code=503, detail="Storage not available")
+    
+    max_size = CONFIG.get("max_file_size_mb", 20) * 1024 * 1024
+    content_parts = []
+    s3_urls = []
+    file_types = []
+    
+    for idx, file in enumerate(files):
+        file_content = await file.read()
+        filename = file.filename or f"file_{idx}"
+        file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
+        mime_type = file.content_type or "application/octet-stream"
+        
+        # Validate file size
+        if len(file_content) > max_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File {filename} too large. Maximum size is {CONFIG.get('max_file_size_mb', 20)}MB"
+            )
+        
+        # Upload to S3
+        try:
+            folder = "chat_images" if mime_type.startswith("image/") else "chat_files"
+            result = storage.upload_bytes(
+                data=file_content,
+                filename=filename,
+                user_id=user_id,
+                folder=folder,
+                content_type=mime_type
+            )
+            s3_urls.append(result.get("url"))
+            file_types.append(file_ext)
+            logger.info(f"File uploaded to S3: {result.get('url')}")
+        except StorageError as e:
+            logger.error(f"S3 upload failed for {filename}: {e}")
+            raise HTTPException(status_code=503, detail=f"Upload failed for {filename}: {e}")
+        
+        # Build content part based on file type
+        if mime_type.startswith("image/"):
+            # Image: base64 encode for OpenAI
+            image_base64 = base64.b64encode(file_content).decode("utf-8")
+            content_parts.append({
+                "type": "input_image",
+                "image_url": f"data:{mime_type};base64,{image_base64}"
+            })
+        elif file_ext == 'pdf':
+            # PDF: Send as file content block
+            file_base64 = base64.b64encode(file_content).decode("utf-8")
+            content_parts.append({
+                "type": "input_file",
+                "filename": filename,
+                "file_data": f"data:application/pdf;base64,{file_base64}"
+            })
+        elif file_ext in ['docx', 'doc']:
+            # DOCX: Extract text
+            try:
+                from docx import Document
+                doc = Document(io.BytesIO(file_content))
+                extracted_text = "\n".join([para.text for para in doc.paragraphs])
+                content_parts.append({
+                    "type": "input_text",
+                    "text": f"[Document Content from {filename}]:\n{extracted_text}"
+                })
+            except Exception as e:
+                logger.error(f"DOCX extraction failed: {e}")
+                raise HTTPException(status_code=422, detail=f"Failed to extract DOCX content: {e}")
+        elif file_ext in ['txt', 'md', 'json', 'yaml', 'yml', 'py', 'js', 'html', 'css', 'xml', 'csv']:
+            # Text files
+            try:
+                text_content = file_content.decode('utf-8')
+                content_parts.append({
+                    "type": "input_text",
+                    "text": f"[File Content from {filename}]:\n{text_content}"
+                })
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=422, detail=f"File {filename} is not a valid text file")
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unsupported file type: {file_ext}. Supported: pdf, docx, txt, md, json, yaml, py, js, html, css, xml, csv, images"
+            )
+    
+    return content_parts, s3_urls, file_types
+
+
+def build_input_with_files(
+    messages: List[ChatMessage],
+    file_content_parts: List[dict],
+    user_message: Optional[str] = None
+) -> List[dict]:
+    """Build OpenAI Chat Completions API messages with file content parts included."""
+    # Use the new build_chat_messages function
+    return build_chat_messages(messages, file_content_parts=file_content_parts)
+
+
+def create_chat_response(
+    response,
+    model: str,
+    conversation_id: str,
+    user_id: str,
+    message_count: int = 1
+) -> ChatCompletionResponse:
+    """Create a ChatCompletionResponse from OpenAI Chat Completions API response."""
+    usage = extract_usage(response)
+    cost = calculate_cost(usage)
+    
+    # Chat Completions API: content is in choices[0].message.content
+    content = ""
+    if response.choices and len(response.choices) > 0:
+        content = response.choices[0].message.content or ""
+    
+    return ChatCompletionResponse(
+        id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        created=int(time.time()),
+        model=model,
+        choices=[
+            Choice(
+                index=0,
+                message=ChoiceMessage(
+                    role="assistant",
+                    content=content
+                ),
+                finish_reason="stop"
+            )
+        ],
+        usage=UsageInfo(
+            prompt_tokens=usage["prompt_tokens"],
+            completion_tokens=usage["completion_tokens"],
+            total_tokens=usage["total_tokens"]
+        ),
+        conversation_id=conversation_id,
+        user_id=user_id,
+        cost=cost
+    )
+
+
+async def stream_chat_response(
+    client: OpenAI,
+    chat_request: ChatRequest,
+    messages: List[dict],
+    conversation_id: str,
+    user_id: str,
+    session_id: Optional[str],
+    is_new_conversation: bool
+):
+    """Generate SSE stream for chat response using Chat Completions API."""
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    timestamp = int(time.time())
+    model = chat_request.model or CONFIG["model"]
+    
+    full_text = []
+    usage_data = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    
+    try:
+        # Initial role message
+        initial_chunk = ChatCompletionStreamResponse(
+            id=completion_id,
+            created=timestamp,
+            model=model,
+            choices=[
+                StreamChoice(
+                    index=0,
+                    delta=DeltaMessage(role="assistant"),
+                    finish_reason=None
+                )
+            ]
+        )
+        yield f"data: {initial_chunk.model_dump_json()}\n\n"
+        
+        # Stream from OpenAI using Chat Completions API
+        stream = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=chat_request.temperature,
+            max_tokens=chat_request.max_tokens,
+            top_p=chat_request.top_p,
+            stream=True,
+            stream_options={"include_usage": True}
+        )
+        
+        for chunk in stream:
+            # Chat Completions streaming: content is in chunk.choices[0].delta.content
+            if chunk.choices and len(chunk.choices) > 0:
+                delta_content = chunk.choices[0].delta.content
+                if delta_content:
+                    full_text.append(delta_content)
+                    
+                    chunk_response = ChatCompletionStreamResponse(
+                        id=completion_id,
+                        created=timestamp,
+                        model=model,
+                        choices=[
+                            StreamChoice(
+                                index=0,
+                                delta=DeltaMessage(content=delta_content),
+                                finish_reason=None
+                            )
+                        ]
+                    )
+                    yield f"data: {chunk_response.model_dump_json()}\n\n"
+            
+            # Check for usage in final chunk (some APIs include it)
+            if hasattr(chunk, 'usage') and chunk.usage:
+                usage_data["prompt_tokens"] = getattr(chunk.usage, 'prompt_tokens', 0)
+                usage_data["completion_tokens"] = getattr(chunk.usage, 'completion_tokens', 0)
+                usage_data["total_tokens"] = getattr(chunk.usage, 'total_tokens', 0)
+        
+        # Final chunk with usage
+        final_chunk = ChatCompletionStreamResponse(
+            id=completion_id,
+            created=timestamp,
+            model=model,
+            choices=[
+                StreamChoice(
+                    index=0,
+                    delta=DeltaMessage(),
+                    finish_reason="stop"
+                )
+            ],
+            usage=UsageInfo(
+                prompt_tokens=usage_data["prompt_tokens"],
+                completion_tokens=usage_data["completion_tokens"],
+                total_tokens=usage_data["total_tokens"]
+            )
+        )
+        yield f"data: {final_chunk.model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        
+        # Update database after stream completes
+        cost = calculate_cost(usage_data)
+        if db:
+            try:
+                db.update_conversation_usage(
+                    conversation_id=conversation_id,
+                    tokens_input=usage_data["prompt_tokens"],
+                    tokens_output=usage_data["completion_tokens"],
+                    cost=cost
+                )
+                update_session_after_chat(session_id, usage_data["total_tokens"], cost, is_new_conversation)
+            except Exception as e:
+                logger.error(f"Failed to update usage after stream: {e}")
+                
+    except Exception as e:
+        logger.error(f"Stream error: {e}")
+        error_chunk = ChatCompletionStreamResponse(
+            id=completion_id,
+            created=timestamp,
+            model=model,
+            choices=[
+                StreamChoice(
+                    index=0,
+                    delta=DeltaMessage(content=f"[ERROR] {str(e)}"),
+                    finish_reason="stop"
+                )
+            ]
+        )
+        yield f"data: {error_chunk.model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+
 
 # =============================================================================
 # Exception Handlers
@@ -365,26 +891,61 @@ def update_session_after_chat(session_id: str, tokens: int, cost: float, increme
 async def chatbot_error_handler(request, exc: ChatbotError):
     return JSONResponse(
         status_code=400,
-        content={"error": exc.message, "detail": str(exc.details), "code": type(exc).__name__}
+        content=ErrorResponse(
+            error=ErrorDetail(
+                message=exc.message,
+                type="chatbot_error",
+                param=None,
+                code=type(exc).__name__
+            )
+        ).model_dump()
     )
+
 
 @app.exception_handler(RateLimitExceededError)
 async def rate_limit_handler(request, exc: RateLimitExceededError):
     return JSONResponse(
         status_code=429,
-        content={
-            "error": exc.message,
-            "retry_after": exc.retry_after,
-            "code": "RateLimitExceeded"
-        },
+        content=ErrorResponse(
+            error=ErrorDetail(
+                message=exc.message,
+                type="rate_limit_error",
+                param=None,
+                code="rate_limit_exceeded"
+            )
+        ).model_dump(),
         headers={"Retry-After": str(int(exc.retry_after or 60))}
     )
+
 
 @app.exception_handler(ValidationError)
 async def validation_error_handler(request, exc: ValidationError):
     return JSONResponse(
         status_code=422,
-        content={"error": exc.message, "field": exc.field, "code": "ValidationError"}
+        content=ErrorResponse(
+            error=ErrorDetail(
+                message=exc.message,
+                type="validation_error",
+                param=getattr(exc, 'field', None),
+                code="validation_error"
+            )
+        ).model_dump()
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_error_handler(request, exc: Exception):
+    logger.error(f"Unhandled error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(
+            error=ErrorDetail(
+                message="Internal server error",
+                type="internal_error",
+                param=None,
+                code="internal_error"
+            )
+        ).model_dump()
     )
 
 
@@ -415,15 +976,50 @@ async def get_readiness():
 
 
 # =============================================================================
-# Chat Endpoints
+# Unified OpenAI-Compatible /chat Endpoint
 # =============================================================================
 
-@app.post("/chat", response_model=ChatResponse, tags=["Chat"])
-async def chat(request: ChatRequest, client: OpenAI = Depends(get_openai)):
-    """Send a chat message and get a response."""
-    user_id = request.user_id or f"user_{uuid.uuid4().hex[:8]}"
-    conversation_id = request.conversation_id
+@app.post("/chat", response_model=ChatCompletionResponse, tags=["Chat"])
+async def chat(
+    request: Request,
+    client: OpenAI = Depends(get_openai)
+):
+    """
+    Unified OpenAI-compatible chat endpoint.
+    
+    Supports:
+    - Text-only chat (application/json)
+    - Streaming (SSE with stream: true)
+    - Images (base64 in JSON or multipart/form-data)
+    - Documents (multipart/form-data)
+    
+    Content-Type handling:
+    - application/json: Text and base64 images
+    - multipart/form-data: File uploads (images, PDFs, DOCX, etc.)
+    """
+    content_type = request.headers.get("content-type", "")
+    
+    # Handle multipart form data (file uploads)
+    if "multipart/form-data" in content_type:
+        return await handle_multipart_chat(request, client)
+    
+    # Handle JSON requests
+    return await handle_json_chat(request, client)
 
+
+async def handle_json_chat(request: Request, client: OpenAI):
+    """Handle JSON chat requests."""
+    try:
+        body = await request.json()
+        chat_request = ChatRequest(**body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Validation error: {e}")
+    
+    user_id = chat_request.user_id or f"user_{uuid.uuid4().hex[:8]}"
+    conversation_id = chat_request.conversation_id
+    
     # Rate limiting
     limiter = get_rate_limiter(user_id)
     try:
@@ -434,33 +1030,27 @@ async def chat(request: ChatRequest, client: OpenAI = Depends(get_openai)):
             detail=str(e),
             headers={"Retry-After": str(int(e.retry_after or 60))}
         )
-
+    
     # Sanitize input
+    text_content = extract_text_from_content(chat_request.messages)
     try:
-        message, warnings = sanitize_input(
-            request.message,
+        _, warnings = sanitize_input(
+            text_content,
             max_length=CONFIG.get("max_input_length", 10000)
         )
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=str(e))
-
-    # Get or create session first (needed for linking)
+    
+    # Session management
     session_id = get_or_create_session(user_id)
     is_new_conversation = False
-
+    
     # Create conversation if needed
     if not conversation_id:
         is_new_conversation = True
-        conv = client.conversations.create(
-            metadata={
-                "app": "terminal_chatbot_api",
-                "user_id": user_id,
-                "created_at": datetime.now().isoformat()
-            }
-        )
-        conversation_id = conv.id
-
-        # Save to database with session_id
+        # Use local UUID for conversation ID (Chat Completions API doesn't manage conversations)
+        conversation_id = f"conv_{uuid.uuid4().hex[:24]}"
+        
         if db:
             try:
                 db.create_conversation(
@@ -471,504 +1061,36 @@ async def chat(request: ChatRequest, client: OpenAI = Depends(get_openai)):
                 )
             except Exception as e:
                 logger.error(f"Failed to save conversation: {e}")
-
-    # Send message
-    try:
-        response = client.responses.create(
-            model=CONFIG["model"],
-            input=message,
-            conversation=conversation_id,
-            instructions=PROMPTS["system_prompt"]
-        )
-    except (APIConnectionError, OpenAIRateLimitError, APITimeoutError) as e:
-        logger.error(f"OpenAI API error: {e}")
-        raise HTTPException(status_code=502, detail=f"OpenAI API error: {type(e).__name__}")
-
-    # Extract usage
-    usage = {
-        "input": getattr(response.usage, 'input_tokens', 0) if response.usage else 0,
-        "output": getattr(response.usage, 'output_tokens', 0) if response.usage else 0,
-        "total": getattr(response.usage, 'total_tokens', 0) if response.usage else 0
-    }
-
-    # Calculate cost
-    pricing = CONFIG["pricing"]
-    cost = round(
-        (usage["input"] / 1000) * pricing["input_per_1k"] +
-        (usage["output"] / 1000) * pricing["output_per_1k"],
-        6
-    )
-
-    # Update usage stats in database (OpenAI stores the actual messages)
-    if db:
-        try:
-            db.update_conversation_usage(
+    
+    # Build messages array for Chat Completions API
+    system_prompt = chat_request.system_prompt or PROMPTS["system_prompt"]
+    model = chat_request.model or CONFIG["model"]
+    messages = build_chat_messages(chat_request.messages, system_prompt=system_prompt)
+    
+    # Handle streaming
+    if chat_request.stream:
+        return StreamingResponse(
+            stream_chat_response(
+                client=client,
+                chat_request=chat_request,
+                messages=messages,
                 conversation_id=conversation_id,
-                tokens_input=usage["input"],
-                tokens_output=usage["output"],
-                cost=cost
-            )
-        except Exception as e:
-            logger.error(f"Failed to update usage: {e}")
-
-    # Session tracking (increment conversation_count if new)
-    update_session_after_chat(session_id, usage["total"], cost, is_new_conversation)
-
-    # Get message count
-    message_count = 1
-    if db:
-        try:
-            conv = db.get_conversation(conversation_id)
-            if conv:
-                message_count = conv.get("message_count", 1)
-        except Exception:
-            pass
-
-    return ChatResponse(
-        text=response.output_text,
-        conversation_id=conversation_id,
-        user_id=user_id,
-        message_number=message_count,
-        usage=usage,
-        cost=cost
-    )
-
-
-@app.post("/chat/stream", tags=["Chat"])
-async def chat_stream(request: ChatRequest, client: OpenAI = Depends(get_openai)):
-    """Send a chat message and stream the response."""
-    user_id = request.user_id or f"user_{uuid.uuid4().hex[:8]}"
-    conversation_id = request.conversation_id
-
-    # Rate limiting
-    limiter = get_rate_limiter(user_id)
-    try:
-        limiter.acquire(block=False)
-    except RateLimitExceededError as e:
-        raise HTTPException(status_code=429, detail=str(e))
-
-    # Sanitize input
-    try:
-        message, _ = sanitize_input(request.message, max_length=CONFIG.get("max_input_length", 10000))
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    # Create conversation if needed
-    if not conversation_id:
-        conv = client.conversations.create(
-            metadata={"app": "terminal_chatbot_api", "user_id": user_id}
-        )
-        conversation_id = conv.id
-        if db:
-            try:
-                db.create_conversation(conversation_id, user_id)
-            except Exception as e:
-                logger.error(f"Failed to save conversation: {e}")
-
-    # Track session for the generate function
-    session_id = get_or_create_session(user_id)
-    is_new_conversation = not request.conversation_id
-
-    async def generate():
-        try:
-            stream = client.responses.create(
-                model=CONFIG["model"],
-                input=message,
-                conversation=conversation_id,
-                instructions=PROMPTS["system_prompt"],
-                stream=True
-            )
-
-            full_text = []
-            usage_data = {"input": 0, "output": 0, "total": 0}
-
-            for event in stream:
-                if hasattr(event, 'type'):
-                    if event.type == 'response.output_text.delta':
-                        delta = getattr(event, 'delta', '')
-                        full_text.append(delta)
-                        yield f"data: {delta}\n\n"
-                    elif event.type == 'response.completed':
-                        # Try to extract usage from completed event
-                        if hasattr(event, 'usage'):
-                            usage_data["input"] = getattr(event.usage, 'input_tokens', 0) or getattr(event.usage, 'prompt_tokens', 0)
-                            usage_data["output"] = getattr(event.usage, 'output_tokens', 0) or getattr(event.usage, 'completion_tokens', 0)
-                            usage_data["total"] = getattr(event.usage, 'total_tokens', 0)
-
-                        yield f"data: [DONE]\n\n"
-
-            # Calculate cost
-            pricing = CONFIG.get("pricing", {"input_per_1k": 0.0025, "output_per_1k": 0.01})
-            cost = round(
-                (usage_data["input"] / 1000) * pricing["input_per_1k"] +
-                (usage_data["output"] / 1000) * pricing["output_per_1k"],
-                6
-            )
-
-            # Update usage stats (OpenAI stores actual messages)
-            if db:
-                try:
-                    db.update_conversation_usage(
-                        conversation_id=conversation_id,
-                        tokens_input=usage_data["input"],
-                        tokens_output=usage_data["output"],
-                        cost=cost
-                    )
-                    # Also update session
-                    update_session_after_chat(session_id, usage_data["total"], cost, is_new_conversation)
-                except Exception as e:
-                    logger.error(f"Failed to update usage: {e}")
-
-        except Exception as e:
-            logger.error(f"Stream error: {e}")
-            yield f"data: [ERROR] {str(e)}\n\n"
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"X-Conversation-ID": conversation_id}
-    )
-
-
-@app.post("/chat/image", response_model=ImageChatResponse, tags=["Chat"])
-async def chat_with_image(
-    message: str = Form(...),
-    images: List[UploadFile] = File(..., description="One or more images"),
-    conversation_id: Optional[str] = Form(None),
-    user_id: Optional[str] = Form(None),
-    client: OpenAI = Depends(get_openai)
-):
-    """Send a chat message with one or more images to GPT-4 Vision."""
-    user_id = user_id or f"user_{uuid.uuid4().hex[:8]}"
-
-    # Rate limiting
-    limiter = get_rate_limiter(user_id)
-    try:
-        limiter.acquire(block=False)
-    except RateLimitExceededError as e:
-        raise HTTPException(
-            status_code=429,
-            detail=str(e),
-            headers={"Retry-After": str(int(e.retry_after or 60))}
-        )
-
-    # Sanitize input
-    try:
-        message, warnings = sanitize_input(
-            message,
-            max_length=CONFIG.get("max_input_length", 10000)
-        )
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    if not storage:
-        raise HTTPException(status_code=503, detail="Storage not available")
-
-    max_size = CONFIG.get("max_file_size_mb", 20) * 1024 * 1024
-    s3_urls = []
-    image_content_list = []
-
-    # Process all images
-    for idx, image in enumerate(images):
-        image_content = await image.read()
-
-        # Validate file size
-        if len(image_content) > max_size:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Image {idx+1} too large. Maximum size is {CONFIG.get('max_file_size_mb', 20)}MB"
-            )
-
-        mime_type = image.content_type or "image/jpeg"
-        image_base64 = base64.b64encode(image_content).decode("utf-8")
-
-        # Upload to S3
-        try:
-            result = storage.upload_bytes(
-                data=image_content,
-                filename=image.filename or f"{uuid.uuid4().hex}.jpg",
                 user_id=user_id,
-                folder="chat_images",
-                content_type=mime_type
-            )
-            s3_urls.append(result.get("url"))
-            logger.info(f"Image {idx+1} uploaded to S3: {result.get('url')}")
-        except StorageError as e:
-            logger.error(f"S3 upload failed for image {idx+1}: {e}")
-            raise HTTPException(status_code=503, detail=f"Image {idx+1} upload failed: {e}")
-
-        image_content_list.append({
-            "base64": image_base64,
-            "mime_type": mime_type
-        })
-
-    # Create conversation if needed (with session linking)
-    session_id = get_or_create_session(user_id)
-    is_new_conversation = False
-
-    if not conversation_id:
-        is_new_conversation = True
-        conv = client.conversations.create(
-            metadata={
-                "app": "terminal_chatbot_api",
-                "user_id": user_id,
-                "created_at": datetime.now().isoformat(),
-                "has_images": "true",
-                "image_count": str(len(images))
-            }
+                session_id=session_id,
+                is_new_conversation=is_new_conversation
+            ),
+            media_type="text/event-stream",
+            headers={"X-Conversation-ID": conversation_id}
         )
-        conversation_id = conv.id
-
-        if db:
-            try:
-                db.create_conversation(
-                    conversation_id=conversation_id,
-                    user_id=user_id,
-                    metadata={"has_images": "true", "image_count": str(len(images))},
-                    session_id=session_id
-                )
-            except Exception as e:
-                logger.error(f"Failed to save conversation: {e}")
-
-    # Build content array with text + all images
-    content_parts = [{"type": "input_text", "text": message}]
-    for img_data in image_content_list:
-        content_parts.append({
-            "type": "input_image",
-            "image_url": f"data:{img_data['mime_type']};base64,{img_data['base64']}"
-        })
-
-    input_content = [
-        {
-            "type": "message",
-            "role": "user",
-            "content": content_parts
-        }
-    ]
-
-    # Call OpenAI (Stateful)
+    
+    # Non-streaming request using Chat Completions API
     try:
-        response = client.responses.create(
-            model="gpt-4o",
-            conversation=conversation_id,
-            input=input_content,
-            instructions=PROMPTS["system_prompt"],
-            max_output_tokens=4096
-        )
-    except (APIConnectionError, OpenAIRateLimitError, APITimeoutError) as e:
-        logger.error(f"OpenAI Vision API error: {e}")
-        raise HTTPException(status_code=502, detail=f"OpenAI API error: {type(e).__name__}")
-
-    # Extract usage and calculate cost
-    usage = {
-        "input": getattr(response.usage, 'input_tokens', 0) if response.usage else 0,
-        "output": getattr(response.usage, 'output_tokens', 0) if response.usage else 0,
-        "total": getattr(response.usage, 'total_tokens', 0) if response.usage else 0
-    }
-
-    # Fallback if usage is missing or different structure
-    if usage["total"] == 0 and hasattr(response, 'usage_metadata'):
-        usage = {
-            "input": getattr(response.usage_metadata, 'prompt_tokens', 0),
-            "output": getattr(response.usage_metadata, 'candidates_token_count', 0),
-            "total": getattr(response.usage_metadata, 'total_token_count', 0)
-        }
-
-    pricing = CONFIG.get("pricing", {"input_per_1k": 0.0025, "output_per_1k": 0.01})
-    cost = round(
-        (usage["input"] / 1000) * pricing["input_per_1k"] +
-        (usage["output"] / 1000) * pricing["output_per_1k"],
-        6
-    )
-
-    # Session tracking
-    update_session_after_chat(session_id, usage["total"], cost, is_new_conversation)
-
-    output_text = response.output_text
-
-    # Update usage stats in database (OpenAI stores actual messages)
-    if db:
-        try:
-            db.update_conversation_usage(
-                conversation_id=conversation_id,
-                tokens_input=usage["input"],
-                tokens_output=usage["output"],
-                cost=cost,
-                image_url=s3_urls[0] if s3_urls else None  # Store first URL for backward compat
-            )
-        except Exception as e:
-            logger.error(f"Failed to update usage: {e}")
-
-    # Get message count
-    message_count = 1
-    if db:
-        try:
-            conv = db.get_conversation(conversation_id)
-            if conv:
-                message_count = conv.get("message_count", 1)
-        except Exception:
-            pass
-
-    return ImageChatResponse(
-        text=output_text,
-        conversation_id=conversation_id,
-        user_id=user_id,
-        message_number=message_count,
-        usage=usage,
-        cost=cost,
-        image_urls=s3_urls,
-        image_count=len(s3_urls)
-    )
-
-
-@app.post("/chat/file", response_model=FileChatResponse, tags=["Chat"])
-async def chat_with_file(
-    message: str = Form(...),
-    file: UploadFile = File(...),
-    conversation_id: Optional[str] = Form(None),
-    user_id: Optional[str] = Form(None),
-    client: OpenAI = Depends(get_openai)
-):
-    """
-    Send a chat message with a file (PDF, DOCX, TXT) to GPT-4.
-    - PDF: Sent directly to OpenAI (native support)
-    - DOCX/TXT: Text extracted and sent to OpenAI
-    """
-    user_id = user_id or f"user_{uuid.uuid4().hex[:8]}"
-
-    # Rate limiting
-    limiter = get_rate_limiter(user_id)
-    try:
-        limiter.acquire(block=False)
-    except RateLimitExceededError as e:
-        raise HTTPException(
-            status_code=429,
-            detail=str(e),
-            headers={"Retry-After": str(int(e.retry_after or 60))}
-        )
-
-    # Sanitize input
-    try:
-        message, warnings = sanitize_input(
-            message,
-            max_length=CONFIG.get("max_input_length", 10000)
-        )
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    # Validate file size
-    max_size = CONFIG.get("max_file_size_mb", 20) * 1024 * 1024
-    file_content = await file.read()
-    if len(file_content) > max_size:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum size is {CONFIG.get('max_file_size_mb', 20)}MB"
-        )
-
-    # Determine file type
-    filename = file.filename or "document"
-    file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
-    mime_type = file.content_type or "application/octet-stream"
-
-    # Upload to S3 (required)
-    s3_url = None
-    if not storage:
-        raise HTTPException(status_code=503, detail="Storage not available")
-
-    try:
-        result = storage.upload_bytes(
-            data=file_content,
-            filename=filename,
-            user_id=user_id,
-            folder="chat_files",
-            content_type=mime_type
-        )
-        s3_url = result.get("url")
-        logger.info(f"File uploaded to S3: {s3_url}")
-    except StorageError as e:
-        logger.error(f"S3 upload failed: {e}")
-        raise HTTPException(status_code=503, detail=f"File upload failed: {e}")
-
-    # Create conversation if needed (with session linking)
-    session_id = get_or_create_session(user_id)
-    is_new_conversation = False
-
-    if not conversation_id:
-        is_new_conversation = True
-        conv = client.conversations.create(
-            metadata={
-                "app": "terminal_chatbot_api",
-                "user_id": user_id,
-                "created_at": datetime.now().isoformat(),
-                "has_files": "true",
-                "file_type": file_ext
-            }
-        )
-        conversation_id = conv.id
-
-        if db:
-            try:
-                db.create_conversation(
-                    conversation_id=conversation_id,
-                    user_id=user_id,
-                    metadata={"has_files": "true", "file_type": file_ext},
-                    session_id=session_id
-                )
-            except Exception as e:
-                logger.error(f"Failed to save conversation: {e}")
-
-    # Prepare input based on file type
-    if file_ext == 'pdf':
-        # PDF: Send as file content block with message wrapper (conversation mode)
-        file_base64 = base64.b64encode(file_content).decode("utf-8")
-        input_content = [
-            {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_file",
-                        "filename": filename,
-                        "file_data": f"data:application/pdf;base64,{file_base64}"
-                    },
-                    {"type": "input_text", "text": message}
-                ]
-            }
-        ]
-    elif file_ext in ['docx', 'doc']:
-        # DOCX: Extract text using python-docx and send as plain text
-        try:
-            from docx import Document
-            import io
-            doc = Document(io.BytesIO(file_content))
-            extracted_text = "\n".join([para.text for para in doc.paragraphs])
-            # Send as plain string (like basic chat)
-            input_content = f"[Document Content from {filename}]:\n{extracted_text}\n\n[User Question]: {message}"
-        except Exception as e:
-            logger.error(f"DOCX extraction failed: {e}")
-            raise HTTPException(status_code=422, detail=f"Failed to extract DOCX content: {e}")
-    elif file_ext in ['txt', 'md', 'json', 'yaml', 'yml', 'py', 'js', 'html', 'css', 'xml', 'csv']:
-        # Text files: Read content directly and send as plain text
-        try:
-            text_content = file_content.decode('utf-8')
-            # Send as plain string (like basic chat)
-            input_content = f"[File Content from {filename}]:\n{text_content}\n\n[User Question]: {message}"
-        except UnicodeDecodeError:
-            raise HTTPException(status_code=422, detail="File is not a valid text file")
-    else:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unsupported file type: {file_ext}. Supported: pdf, docx, txt, md, json, yaml, py, js, html, css, xml, csv"
-        )
-
-    # Call OpenAI (Stateful)
-    try:
-        response = client.responses.create(
-            model="gpt-4o",
-            conversation=conversation_id,
-            input=input_content,
-            instructions=PROMPTS["system_prompt"],
-            max_output_tokens=4096
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=chat_request.temperature,
+            max_tokens=chat_request.max_tokens,
+            top_p=chat_request.top_p
         )
     except (APIConnectionError, OpenAIRateLimitError, APITimeoutError) as e:
         logger.error(f"OpenAI API error: {e}")
@@ -976,38 +1098,26 @@ async def chat_with_file(
     except APIError as e:
         logger.error(f"OpenAI API error: {e}")
         raise HTTPException(status_code=502, detail=f"OpenAI API error: {str(e)}")
-
+    
     # Extract usage and calculate cost
-    usage = {
-        "input": getattr(response.usage, 'input_tokens', 0) if response.usage else 0,
-        "output": getattr(response.usage, 'output_tokens', 0) if response.usage else 0,
-        "total": getattr(response.usage, 'total_tokens', 0) if response.usage else 0
-    }
-
-    pricing = CONFIG.get("pricing", {"input_per_1k": 0.0025, "output_per_1k": 0.01})
-    cost = round(
-        (usage["input"] / 1000) * pricing["input_per_1k"] +
-        (usage["output"] / 1000) * pricing["output_per_1k"],
-        6
-    )
-
-    # Session tracking
-    update_session_after_chat(session_id, usage["total"], cost, is_new_conversation)
-
-    output_text = response.output_text
-
-    # Update usage stats in database
+    usage = extract_usage(response)
+    cost = calculate_cost(usage)
+    
+    # Update database
     if db:
         try:
             db.update_conversation_usage(
                 conversation_id=conversation_id,
-                tokens_input=usage["input"],
-                tokens_output=usage["output"],
+                tokens_input=usage["prompt_tokens"],
+                tokens_output=usage["completion_tokens"],
                 cost=cost
             )
         except Exception as e:
             logger.error(f"Failed to update usage: {e}")
-
+    
+    # Session tracking
+    update_session_after_chat(session_id, usage["total_tokens"], cost, is_new_conversation)
+    
     # Get message count
     message_count = 1
     if db:
@@ -1017,16 +1127,184 @@ async def chat_with_file(
                 message_count = conv.get("message_count", 1)
         except Exception:
             pass
-
-    return FileChatResponse(
-        text=output_text,
+    
+    return create_chat_response(
+        response=response,
+        model=model,
         conversation_id=conversation_id,
         user_id=user_id,
-        message_number=message_count,
-        usage=usage,
-        cost=cost,
-        file_url=s3_url,
-        file_type=file_ext
+        message_count=message_count
+    )
+
+
+async def handle_multipart_chat(request: Request, client: OpenAI):
+    """Handle multipart form data chat requests with file uploads."""
+    try:
+        form = await request.form()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid form data: {e}")
+    
+    # Parse messages from JSON string
+    messages_json = form.get("messages", "[]")
+    try:
+        messages_data = json.loads(messages_json)
+        messages = [ChatMessage(**m) for m in messages_data]
+    except (json.JSONDecodeError, Exception) as e:
+        raise HTTPException(status_code=422, detail=f"Invalid messages JSON: {e}")
+    
+    # Get other parameters
+    model = form.get("model", CONFIG["model"])
+    stream = form.get("stream", "false").lower() == "true"
+    temperature = float(form.get("temperature", 1.0))
+    max_tokens = int(form.get("max_tokens")) if form.get("max_tokens") else None
+    user_id = form.get("user_id") or f"user_{uuid.uuid4().hex[:8]}"
+    conversation_id = form.get("conversation_id")
+    system_prompt_override = form.get("system_prompt")
+    
+    # Get files (use hasattr check since UploadFile type may differ between fastapi/starlette)
+    files: List[UploadFile] = []
+    for key in form.keys():
+        if key in ["files", "images"]:
+            value = form.getlist(key)
+            for f in value:
+                if hasattr(f, 'filename') and hasattr(f, 'read'):
+                    files.append(f)
+    
+    # Rate limiting
+    limiter = get_rate_limiter(user_id)
+    try:
+        limiter.acquire(block=False)
+    except RateLimitExceededError as e:
+        raise HTTPException(
+            status_code=429,
+            detail=str(e),
+            headers={"Retry-After": str(int(e.retry_after or 60))}
+        )
+    
+    # Sanitize input
+    text_content = extract_text_from_content(messages)
+    try:
+        _, warnings = sanitize_input(
+            text_content,
+            max_length=CONFIG.get("max_input_length", 10000)
+        )
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    
+    # Process files if any
+    file_content_parts = []
+    s3_urls = []
+    file_types = []
+    
+    if files:
+        file_content_parts, s3_urls, file_types = await process_uploaded_files(files, user_id)
+    
+    # Session management
+    session_id = get_or_create_session(user_id)
+    is_new_conversation = False
+    
+    # Create conversation if needed
+    if not conversation_id:
+        is_new_conversation = True
+        # Use local UUID for conversation ID (Chat Completions API doesn't manage conversations)
+        conversation_id = f"conv_{uuid.uuid4().hex[:24]}"
+        
+        if db:
+            try:
+                db_metadata = {"has_files": "true"} if file_types else {}
+                db.create_conversation(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    metadata=db_metadata,
+                    session_id=session_id
+                )
+            except Exception as e:
+                logger.error(f"Failed to save conversation: {e}")
+    
+    # Build messages array for Chat Completions API (with file content parts)
+    system_prompt = system_prompt_override or PROMPTS["system_prompt"]
+    messages = build_chat_messages(messages, system_prompt=system_prompt, file_content_parts=file_content_parts)
+    
+    # Create ChatRequest for streaming
+    chat_request = ChatRequest(
+        model=model,
+        messages=messages,
+        stream=stream,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        system_prompt=system_prompt_override
+    )
+    
+    # Handle streaming
+    if stream:
+        return StreamingResponse(
+            stream_chat_response(
+                client=client,
+                chat_request=chat_request,
+                messages=messages,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                session_id=session_id,
+                is_new_conversation=is_new_conversation
+            ),
+            media_type="text/event-stream",
+            headers={"X-Conversation-ID": conversation_id}
+        )
+    
+    # Non-streaming request using Chat Completions API
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=1.0
+        )
+    except (APIConnectionError, OpenAIRateLimitError, APITimeoutError) as e:
+        logger.error(f"OpenAI API error: {e}")
+        raise HTTPException(status_code=502, detail=f"OpenAI API error: {type(e).__name__}")
+    except APIError as e:
+        logger.error(f"OpenAI API error: {e}")
+        raise HTTPException(status_code=502, detail=f"OpenAI API error: {str(e)}")
+    
+    # Extract usage and calculate cost
+    usage = extract_usage(response)
+    cost = calculate_cost(usage)
+    
+    # Update database with file URLs
+    if db:
+        try:
+            db.update_conversation_usage(
+                conversation_id=conversation_id,
+                tokens_input=usage["prompt_tokens"],
+                tokens_output=usage["completion_tokens"],
+                cost=cost,
+                image_url=s3_urls[0] if s3_urls else None
+            )
+        except Exception as e:
+            logger.error(f"Failed to update usage: {e}")
+    
+    # Session tracking
+    update_session_after_chat(session_id, usage["total_tokens"], cost, is_new_conversation)
+    
+    # Get message count
+    message_count = 1
+    if db:
+        try:
+            conv = db.get_conversation(conversation_id)
+            if conv:
+                message_count = conv.get("message_count", 1)
+        except Exception:
+            pass
+    
+    return create_chat_response(
+        response=response,
+        model=model,
+        conversation_id=conversation_id,
+        user_id=user_id,
+        message_count=message_count
     )
 
 
@@ -1036,31 +1314,28 @@ async def chat_with_file(
 
 @app.post("/conversations", response_model=ConversationResponse, tags=["Conversations"])
 async def create_conversation(
-    request: ConversationCreate,
-    client: OpenAI = Depends(get_openai)
+    request: ConversationCreate
 ):
     """Create a new conversation."""
-    conv = client.conversations.create(
-        metadata={
-            "app": "terminal_chatbot_api",
-            "user_id": request.user_id,
-            "created_at": datetime.now().isoformat(),
-            **(request.metadata or {})
-        }
-    )
+    # Chat Completions API doesn't manage conversations - we create local conversation ID
+    conversation_id = f"conv_{uuid.uuid4().hex[:24]}"
 
     if db:
         try:
             db.create_conversation(
-                conversation_id=conv.id,
+                conversation_id=conversation_id,
                 user_id=request.user_id,
-                metadata=request.metadata
+                metadata={
+                    "app": "terminal_chatbot_api",
+                    "created_at": datetime.now().isoformat(),
+                    **(request.metadata or {})
+                }
             )
         except Exception as e:
             logger.error(f"Failed to save conversation: {e}")
 
     return ConversationResponse(
-        id=conv.id,
+        id=conversation_id,
         user_id=request.user_id,
         created_at=datetime.now().isoformat(),
         message_count=0
@@ -1139,38 +1414,39 @@ async def delete_conversation(conversation_id: str, soft: bool = True):
 async def get_messages(
     conversation_id: str,
     limit: int = Query(100, ge=1, le=1000),
-    order: str = Query("asc", pattern="^(asc|desc)$"),
-    client: OpenAI = Depends(get_openai)
+    order: str = Query("asc", pattern="^(asc|desc)$")
 ):
-    """Get messages for a conversation from OpenAI Conversations API."""
+    """Get messages for a conversation from database."""
     try:
         validate_conversation_id(conversation_id)
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    # Chat Completions API doesn't store conversation history - get from database
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available - conversation history unavailable")
+    
     try:
-        items = client.conversations.items.list(
+        messages = db.get_conversation_messages(
             conversation_id=conversation_id,
             limit=limit,
             order=order
         )
-
-        messages = []
-        for item in items.data:
-            if item.type == "message":
-                content = getattr(item.content[0], 'text', '') if item.content else ''
-                messages.append(MessageResponse(
-                    id=item.id,
-                    role=item.role,
-                    content=content,
-                    created_at=datetime.now().isoformat(),
-                    tokens_input=0,
-                    tokens_output=0,
-                    cost=0
-                ))
-        return messages
+        
+        return [
+            MessageResponse(
+                id=str(msg.get("id", uuid.uuid4())),
+                role=msg.get("role", "user"),
+                content=msg.get("content", ""),
+                created_at=msg.get("created_at", datetime.now().isoformat()),
+                tokens_input=msg.get("tokens_input", 0),
+                tokens_output=msg.get("tokens_output", 0),
+                cost=float(msg.get("cost", 0))
+            )
+            for msg in messages
+        ]
     except Exception as e:
-        logger.error(f"Failed to fetch messages from OpenAI: {e}")
+        logger.error(f"Failed to fetch messages from database: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch messages")
 
 
@@ -1360,7 +1636,7 @@ async def root():
     """API root - basic info."""
     return {
         "name": "Terminal Chatbot API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "running",
         "endpoints": {
             "chat": "/chat",
@@ -1368,6 +1644,12 @@ async def root():
             "files": "/files",
             "health": "/health",
             "docs": "/docs"
+        },
+        "features": {
+            "openai_compatible": True,
+            "streaming": True,
+            "multimodal": True,
+            "file_uploads": True
         }
     }
 
