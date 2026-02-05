@@ -56,7 +56,7 @@ class RateLimitExceededError(ChatbotError):
 
 
 class CostLimitExceededError(ChatbotError):
-    """Raised when the session cost limit has been reached."""
+    """Raised when the cost limit has been reached."""
 
     def __init__(
         self,

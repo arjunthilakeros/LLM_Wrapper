@@ -1,37 +1,25 @@
-# Terminal Chatbot Configuration
+# Production Configuration for Pro Users
 
-# Model Settings
+# Model
 model: gpt-4o
 
-# Conversation Settings
-max_history_items: 100
-
 # Rate Limiting
-rate_limit_per_minute: 10
-max_input_length: 10000
+rate_limit_per_minute: 60        # Higher for pro users
+max_input_length: 50000          # Allow longer inputs
 
-# File Upload Settings
-max_file_size_mb: 20
-max_document_chars: 50000
+# Context Management
+context_management:
+  mode: summary_window           # Reduces costs for long conversations
+  window_size: 5                 # Keep last 10 messages (5 pairs)
+  summarize_after_messages: 10   # Start summarizing after 10 messages
+  summary_update_interval: 5     # Update summary every 5 messages
+  summary_model: gpt-4o-mini     # Cheap model for summaries
+  max_summary_tokens: 500
 
-# Cost Control (USD)
-cost_limit_per_session: 5.0
-warn_at_cost: 1.0
-
-# Token Pricing (per 1K tokens) - GPT-4o as of 2025
+# Pricing (GPT-4o)
 pricing:
   input_per_1k: 0.0025
   output_per_1k: 0.01
-
-# Storage
-data_dir: ./data
-export_dir: ./exports
-upload_dir: ./uploads
-
-# Display
-show_tokens: true
-show_cost: true
-stream_responses: true
 
 # Logging
 logging:
@@ -39,6 +27,6 @@ logging:
   log_to_file: true
   log_dir: ./logs
 
-# API Settings
-api_timeout: 30
+# API
+api_timeout: 60
 api_max_retries: 3

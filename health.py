@@ -9,7 +9,7 @@ import time
 import platform
 import psutil
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict
 
 from logger import get_logger
 
@@ -173,45 +173,6 @@ def health_check(include_details: bool = False) -> Dict:
         result["resources"] = get_resource_usage()
 
     return result
-
-
-def liveness_check() -> Dict:
-    """
-    Simple liveness check (is the application running?).
-    Used by Kubernetes/Docker health probes.
-    """
-    return {
-        "status": "alive",
-        "timestamp": datetime.now().isoformat()
-    }
-
-
-def readiness_check() -> Dict:
-    """
-    Readiness check (is the application ready to serve requests?).
-    Used by Kubernetes/Docker readiness probes.
-    """
-    # Check critical services
-    api_status = check_openai_api()
-    storage_status = check_storage()
-
-    issues = []
-    if api_status.get("status") != "configured":
-        issues.append("OpenAI API not configured")
-    if storage_status.get("status") not in ["healthy"]:
-        issues.append(f"S3 storage: {storage_status.get('error', 'unavailable')}")
-
-    if not issues:
-        return {
-            "status": "ready",
-            "timestamp": datetime.now().isoformat()
-        }
-
-    return {
-        "status": "not_ready",
-        "timestamp": datetime.now().isoformat(),
-        "reason": "; ".join(issues)
-    }
 
 
 def print_health_status():

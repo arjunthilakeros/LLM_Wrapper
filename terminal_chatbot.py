@@ -1,7 +1,7 @@
 """
-Production-Ready Terminal Chatbot - OpenAI-Compatible API Version
-Unified /chat endpoint with multimodal support (text, images, documents)
-With PostgreSQL database and S3 storage support.
+Production-Ready Terminal Chatbot - OpenAI Responses API Version
+Uses ONLY the OpenAI Responses API and Conversations API for persistence.
+NO local message history storage - all state is managed by OpenAI.
 
 Requires: pip install openai>=1.50.0 pyyaml tenacity psycopg2-binary boto3 python-dotenv
 Optional: pip install PyPDF2 python-docx (for PDF/DOCX support)
@@ -29,7 +29,7 @@ except ImportError:
 
 try:
     import yaml
-    from openai import OpenAI, APIConnectionError, RateLimitError, APITimeoutError, APIError
+    from openai import APIConnectionError, RateLimitError, APITimeoutError, APIError
 except ImportError as e:
     print(f"Missing package: {e}")
     print("Install: pip install openai>=1.50.0 pyyaml tenacity")
@@ -49,7 +49,17 @@ from exceptions import (
 from validators import sanitize_input, validate_conversation_id, validate_file_path
 from rate_limiter import TokenBucketRateLimiter
 from config_validator import validate_config
-from api_client import create_openai_client, get_retry_decorator
+
+# Import Responses API client ONLY (NO Chat Completions)
+from responses_client import (
+    ResponsesAPIClient,
+    create_responses_client,
+    extract_output_text,
+    extract_usage,
+)
+
+# Import Context Manager for Summary + Window strategy
+from context_manager import ContextManager, ContextConfig
 
 # Optional database support
 try:
@@ -109,7 +119,7 @@ def load_config() -> dict:
         "rate_limit_per_minute": 10,
         "max_input_length": 10000,
         "max_file_size_mb": 20,
-        "cost_limit_per_session": 5.0,
+
         "warn_at_cost": 1.0,
         "pricing": {"input_per_1k": 0.0025, "output_per_1k": 0.01},
         "data_dir": "./data",
@@ -138,7 +148,7 @@ def load_prompts() -> dict:
     prompts_path = BASE_DIR / "prompts.yaml"
     default_prompts = {
         "system_prompt": "You are a helpful AI assistant. Be concise and helpful.",
-        "welcome_message": "Terminal Chatbot - OpenAI-Compatible API",
+        "welcome_message": "Terminal Chatbot - OpenAI Responses API",
         "custom_prompts": {}
     }
 
@@ -180,7 +190,7 @@ if DATABASE_AVAILABLE and DATABASE_ENABLED:
 
 
 class FileHandler:
-    """Handle file uploads - images and documents with OpenAI-compatible format"""
+    """Handle file uploads - images and documents with OpenAI Responses API format"""
 
     @staticmethod
     def get_file_type(filepath: Path) -> str:
@@ -223,7 +233,7 @@ class FileHandler:
 
     @staticmethod
     def read_image(filepath: Path) -> dict:
-        """Read image and encode as base64, return OpenAI-compatible format"""
+        """Read image and encode as base64, return Responses API format"""
         mime_type, _ = mimetypes.guess_type(str(filepath))
         if not mime_type:
             mime_type = "image/jpeg"
@@ -231,7 +241,7 @@ class FileHandler:
         with open(filepath, "rb") as f:
             image_data = base64.b64encode(f.read()).decode("utf-8")
 
-        # Return OpenAI-compatible image_url content part
+        # Return Responses API format: image_url content part
         return {
             "type": "image_url",
             "image_url": {
@@ -244,7 +254,7 @@ class FileHandler:
 
     @staticmethod
     def read_document(filepath: Path) -> dict:
-        """Read text document, return OpenAI-compatible text format"""
+        """Read text document, return Responses API format"""
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -252,7 +262,7 @@ class FileHandler:
             with open(filepath, "r", encoding="latin-1") as f:
                 content = f.read()
 
-        # Return OpenAI-compatible text content part
+        # Return Responses API format: text content part
         return {
             "type": "text",
             "text": f"[Document: {filepath.name}]\n```\n{content}\n```",
@@ -262,7 +272,7 @@ class FileHandler:
 
     @staticmethod
     def read_pdf(filepath: Path) -> dict:
-        """Read PDF document, return OpenAI-compatible text format"""
+        """Read PDF document, return Responses API format"""
         if not PDF_SUPPORT:
             return {"type": "error", "message": "PDF support not installed"}
 
@@ -275,7 +285,7 @@ class FileHandler:
 
         content = "".join(text_parts)
         
-        # Return OpenAI-compatible text content part
+        # Return Responses API format: text content part
         return {
             "type": "text",
             "text": f"[PDF Document: {filepath.name}]\n```\n{content}\n```",
@@ -286,14 +296,14 @@ class FileHandler:
 
     @staticmethod
     def read_docx(filepath: Path) -> dict:
-        """Read DOCX document, return OpenAI-compatible text format"""
+        """Read DOCX document, return Responses API format"""
         if not DOCX_SUPPORT:
             return {"type": "error", "message": "DOCX support not installed"}
 
         doc = docx.Document(filepath)
         content = "\n".join([para.text for para in doc.paragraphs])
 
-        # Return OpenAI-compatible text content part
+        # Return Responses API format: text content part
         return {
             "type": "text",
             "text": f"[DOCX Document: {filepath.name}]\n```\n{content}\n```",
@@ -303,7 +313,7 @@ class FileHandler:
 
     @staticmethod
     def process_file(filepath: Path) -> dict:
-        """Process any supported file and return OpenAI-compatible content part"""
+        """Process any supported file and return Responses API compatible content part"""
         file_type = FileHandler.get_file_type(filepath)
 
         if file_type == "image":
@@ -319,32 +329,54 @@ class FileHandler:
 
 
 class ConversationManager:
-    """Production-ready conversation manager with OpenAI-compatible API"""
+    """
+    Production-ready conversation manager using OpenAI Responses API ONLY.
+    
+    Key characteristics:
+    - Uses ONLY responses.create (NO chat.completions.create)
+    - Uses ONLY conversation_id from OpenAI Conversations API for persistence
+    - NO local message history storage - history comes from OpenAI API
+    """
 
     def __init__(self, user_id: str = None):
-        self.client = create_openai_client(
+        # Initialize Responses API Client (NOT OpenAI client directly)
+        self.client = create_responses_client(
             api_key=OPENAI_API_KEY,
-            timeout=CONFIG.get("api_timeout", 30)
-        )
-        self._retry_decorator = get_retry_decorator(
+            timeout=CONFIG.get("api_timeout", 30),
             max_retries=CONFIG.get("api_max_retries", 3)
         )
+        
         self.user_id = user_id or f"user_{uuid.uuid4().hex[:8]}"
-        self.session_id = f"session_{uuid.uuid4().hex[:8]}"
+        
+        # Local tracking ID (for database/JSON persistence)
         self.conversation_id = None
+        
+        # OpenAI Conversation ID from Conversations API - THIS IS THE SOURCE OF TRUTH
+        self.openai_conversation_id = None
+        
         self.message_count = 0
-        self.session_tokens = {"input": 0, "output": 0, "total": 0}
-        self.session_cost = 0.0
+        self.total_tokens = {"input": 0, "output": 0, "total": 0}
+        self.total_cost = 0.0
         self.conversations_list = []
         self.pending_files = []
         self._should_shutdown = False
         
-        # Message history for OpenAI-compatible API
-        self.messages: List[Dict[str, Any]] = []
+        # NO local message history - we use OpenAI's conversation storage
+        # self.messages is removed/kept minimal for compatibility only
 
         # Database reference
         self.db = db
         self.use_database = db is not None
+
+        # Initialize Context Manager for Summary + Window strategy
+        self.context_config = ContextConfig.from_dict(CONFIG)
+        self.context_manager = ContextManager(
+            config=self.context_config,
+            responses_client=self.client,
+            database=self.db,
+            data_dir=BASE_DIR / CONFIG["data_dir"],
+        )
+        logger.info(f"Context mode: {self.context_config.mode}")
 
         # Initialize rate limiter
         self.rate_limiter = TokenBucketRateLimiter(
@@ -362,7 +394,6 @@ class ConversationManager:
         # Load conversations
         if self.use_database:
             self._load_conversations_from_db()
-            self._create_session()
         else:
             self._load_conversations_list()
 
@@ -373,14 +404,6 @@ class ConversationManager:
 
         storage_status = "Database" if self.use_database else "JSON files"
         logger.info(f"ConversationManager initialized for user {self.user_id} ({storage_status})")
-
-    def _create_session(self):
-        """Create a session in the database."""
-        if self.db:
-            try:
-                self.db.create_session(self.session_id, self.user_id)
-            except Exception as e:
-                logger.error(f"Failed to create session: {e}")
 
     @property
     def should_shutdown(self) -> bool:
@@ -393,16 +416,10 @@ class ConversationManager:
 
     def _cleanup(self):
         logger.info(
-            f"Session ending - User: {self.user_id}, "
-            f"Tokens: {self.session_tokens}, Cost: ${self.session_cost:.4f}"
+            f"Cleanup - User: {self.user_id}, "
+            f"Tokens: {self.total_tokens}, Cost: ${self.total_cost:.4f}"
         )
-        if self.use_database and self.db:
-            try:
-                self.db.end_session(self.session_id)
-            except Exception as e:
-                logger.error(f"Failed to end session: {e}")
-        else:
-            self._save_conversations_list()
+        self._save_conversations_list()
 
     def _get_user_file(self) -> Path:
         return self.data_dir / f"{self.user_id}_conversations.json"
@@ -484,12 +501,12 @@ class ConversationManager:
                     pass
 
     def _check_cost_limit(self):
-        limit = CONFIG.get("cost_limit_per_session", 5.0)
-        if self.session_cost >= limit:
-            logger.warning(f"Cost limit exceeded: ${self.session_cost:.4f} >= ${limit:.2f}")
+        limit = CONFIG.get("cost_limit", 5.0)
+        if self.total_cost >= limit:
+            logger.warning(f"Cost limit exceeded: ${self.total_cost:.4f} >= ${limit:.2f}")
             raise CostLimitExceededError(
-                message="Session cost limit exceeded. Please start a new session.",
-                current_cost=self.session_cost,
+                message="Cost limit exceeded. Please start a new conversation.",
+                current_cost=self.total_cost,
                 limit=limit
             )
 
@@ -501,12 +518,9 @@ class ConversationManager:
             raise
 
     def _execute_with_retry(self, operation, *args, **kwargs):
-        @self._retry_decorator
-        def _inner():
-            return operation(*args, **kwargs)
-
+        """Execute API operation with retry logic from ResponsesAPIClient."""
         try:
-            return _inner()
+            return operation(*args, **kwargs)
         except (APIConnectionError, RateLimitError, APITimeoutError) as e:
             logger.error(f"API call failed after retries: {e}", exc_info=True)
             raise ChatbotAPIError(
@@ -516,22 +530,32 @@ class ConversationManager:
             ) from e
 
     def create_conversation(self) -> str:
-        """Create a new conversation (using OpenAI-compatible format with conversation tracking)."""
-        # Generate a conversation ID for tracking
+        """
+        Create a new conversation using OpenAI Conversations API.
+        The OpenAI conversation_id is the source of truth for persistence.
+        """
+        # Generate a local conversation ID for tracking
         conv_id = f"conv_{uuid.uuid4().hex[:16]}"
         self.conversation_id = conv_id
         self.message_count = 0
-        
-        # Reset message history
-        self.messages = []
-        
-        # Add system prompt if configured
-        system_prompt = PROMPTS.get("system_prompt")
-        if system_prompt:
-            self.messages.append({
-                "role": "system",
-                "content": system_prompt
-            })
+
+        # Create conversation in OpenAI Conversations API
+        try:
+            system_prompt = PROMPTS.get("system_prompt")
+            conversation = self.client.create_conversation(
+                metadata={
+                    "user_id": self.user_id,
+                    "local_conv_id": conv_id,
+                    "app": "terminal_chatbot",
+                    "api_version": "responses-api"
+                }
+            )
+            self.openai_conversation_id = conversation.id
+            logger.info(f"Created OpenAI conversation: {self.openai_conversation_id}")
+        except Exception as e:
+            logger.error(f"Failed to create OpenAI conversation: {e}")
+            # Continue without OpenAI conversation - will be created on first message
+            self.openai_conversation_id = None
 
         # Save to database or local list
         if self.use_database and self.db:
@@ -539,7 +563,11 @@ class ConversationManager:
                 self.db.create_conversation(
                     conversation_id=conv_id,
                     user_id=self.user_id,
-                    metadata={"app": "terminal_chatbot", "api_version": "openai-compatible"}
+                    metadata={
+                        "app": "terminal_chatbot",
+                        "api_version": "responses-api",
+                        "openai_conversation_id": self.openai_conversation_id
+                    }
                 )
             except Exception as e:
                 logger.error(f"Failed to save conversation to database: {e}")
@@ -547,17 +575,18 @@ class ConversationManager:
         self.conversations_list.append({
             "id": conv_id,
             "created_at": datetime.now().isoformat(),
-            "message_count": 0
+            "message_count": 0,
+            "openai_conversation_id": self.openai_conversation_id
         })
 
         if not self.use_database:
             self._save_conversations_list()
 
-        logger.info(f"Created new conversation: {conv_id}")
+        logger.info(f"Created new conversation: {conv_id} (OpenAI: {self.openai_conversation_id})")
         return conv_id
 
     def upload_file(self, filepath: str) -> dict:
-        """Upload a file and store as OpenAI-compatible content part."""
+        """Upload a file and store as Responses API compatible content part."""
         try:
             path, warnings = validate_file_path(filepath)
             for warning in warnings:
@@ -586,17 +615,16 @@ class ConversationManager:
             "pending_count": len(self.pending_files)
         }
 
-    def _build_messages(self, user_message: str) -> List[Dict[str, Any]]:
-        """Build OpenAI-compatible messages array with pending files."""
+    def _build_input(self, user_message: str) -> Union[str, List[Dict[str, Any]]]:
+        """
+        Build Responses API input format with pending files.
+        Returns either a simple string or list of message objects.
+        """
         if not self.pending_files:
-            # Simple text message
-            self.messages.append({
-                "role": "user",
-                "content": user_message
-            })
-            return self.messages.copy()
+            # Simple text input
+            return user_message
 
-        # Build multimodal content
+        # Build multimodal content for Responses API
         content_parts = [{"type": "text", "text": user_message}]
         
         for file_data in self.pending_files:
@@ -618,22 +646,20 @@ class ConversationManager:
         # Clear pending files after building input
         self.pending_files = []
         
-        self.messages.append({
-            "role": "user",
-            "content": content_parts
-        })
-        
-        return self.messages.copy()
+        # Return as a single user message with content array
+        return [{"role": "user", "content": content_parts}]
 
     def _extract_usage(self, response) -> dict:
-        """Extract token usage from OpenAI-compatible response."""
-        if not response.usage:
+        """Extract token usage from Responses API response."""
+        usage_data = extract_usage(response)
+        if not usage_data:
             return {"input": 0, "output": 0, "total": 0}
-        # OpenAI-compatible format: prompt_tokens, completion_tokens
+        
+        # Map Responses API format to internal format
         return {
-            "input": getattr(response.usage, 'prompt_tokens', 0),
-            "output": getattr(response.usage, 'completion_tokens', 0),
-            "total": getattr(response.usage, 'total_tokens', 0)
+            "input": usage_data.get("input_tokens", 0),
+            "output": usage_data.get("output_tokens", 0),
+            "total": usage_data.get("total_tokens", 0)
         }
 
     def _calculate_cost(self, usage: dict) -> float:
@@ -643,27 +669,16 @@ class ConversationManager:
         output_cost = (usage.get("output", 0) / 1000) * pricing["output_per_1k"]
         return round(input_cost + output_cost, 6)
 
-    def _update_session_stats(self, usage: dict):
-        """Update session token and cost statistics."""
-        self.session_tokens["input"] += usage.get("input", 0)
-        self.session_tokens["output"] += usage.get("output", 0)
-        self.session_tokens["total"] += usage.get("total", 0)
+    def _update_usage_stats(self, usage: dict):
+        """Update token and cost statistics."""
+        self.total_tokens["input"] += usage.get("input", 0)
+        self.total_tokens["output"] += usage.get("output", 0)
+        self.total_tokens["total"] += usage.get("total", 0)
         cost = self._calculate_cost(usage)
-        self.session_cost += cost
+        self.total_cost += cost
 
-        # Update database session stats
-        if self.use_database and self.db:
-            try:
-                self.db.update_session_stats(
-                    self.session_id,
-                    tokens=usage.get("total", 0),
-                    cost=cost
-                )
-            except Exception as e:
-                logger.error(f"Failed to update session stats: {e}")
-
-        if self.session_cost >= CONFIG["warn_at_cost"]:
-            print(f"\n[Warning: Session cost ${self.session_cost:.4f}]")
+        if self.total_cost >= CONFIG.get("warn_at_cost", 1.0):
+            print(f"\n[Warning: Total cost ${self.total_cost:.4f}]")
 
     def _update_conversation_count(self):
         """Update conversation message count."""
@@ -684,15 +699,43 @@ class ConversationManager:
         else:
             self._save_conversations_list()
 
-    def _add_assistant_message(self, content: str):
-        """Add assistant message to conversation history."""
-        self.messages.append({
-            "role": "assistant",
-            "content": content
-        })
+    def _ensure_conversation(self):
+        """Ensure we have an OpenAI conversation ID."""
+        if not self.conversation_id:
+            self.create_conversation()
+        
+        # Create OpenAI conversation if needed
+        if not self.openai_conversation_id:
+            try:
+                conversation = self.client.create_conversation(
+                    metadata={
+                        "user_id": self.user_id,
+                        "local_conv_id": self.conversation_id,
+                        "app": "terminal_chatbot"
+                    }
+                )
+                self.openai_conversation_id = conversation.id
+                logger.info(f"Created OpenAI conversation on first message: {self.openai_conversation_id}")
+                
+                # Update local record with OpenAI conversation ID
+                for conv in self.conversations_list:
+                    if conv["id"] == self.conversation_id:
+                        conv["openai_conversation_id"] = self.openai_conversation_id
+                        break
+                        
+            except Exception as e:
+                logger.error(f"Failed to create OpenAI conversation: {e}")
+                raise ChatbotAPIError(f"Failed to create conversation: {e}") from e
 
     def chat(self, message: str) -> dict:
-        """Send a chat message using OpenAI-compatible format."""
+        """
+        Send a chat message using ONLY OpenAI Responses API.
+        NO chat.completions.create - uses ONLY responses.create.
+
+        Context Management:
+        - mode="full": Uses conversation_id, OpenAI handles full history
+        - mode="summary_window": Manually builds [Summary] + [Window] context
+        """
         self._check_cost_limit()
         self._check_rate_limit()
 
@@ -708,32 +751,75 @@ class ConversationManager:
             logger.error(f"Input validation failed: {e}")
             raise
 
-        if not self.conversation_id:
-            self.create_conversation()
+        # Ensure conversation exists
+        self._ensure_conversation()
 
-        # Build messages array with any pending files
-        messages = self._build_messages(message)
+        # Build input with any pending files
+        base_input = self._build_input(message)
 
-        # Make OpenAI-compatible API call
-        response = self._execute_with_retry(
-            self.client.chat.completions.create,
-            model=CONFIG["model"],
-            messages=messages,
-            temperature=CONFIG.get("temperature", 1.0),
-            max_tokens=CONFIG.get("max_tokens"),
-            user=self.user_id
+        # Determine context strategy
+        use_summary_window = (
+            self.context_config.mode == "summary_window" and
+            self.message_count >= self.context_config.summarize_after_messages
         )
 
-        # Extract response using OpenAI-compatible format
-        output_text = response.choices[0].message.content
+        context_metadata = {}
+
+        if use_summary_window:
+            # Summary + Window mode: manually build context
+            context_result = self.context_manager.build_context_for_api(
+                conversation_id=self.openai_conversation_id,
+                new_message=message if isinstance(base_input, str) else message,
+                system_prompt=PROMPTS.get("system_prompt"),
+                message_count=self.message_count
+            )
+
+            input_data = context_result["input"]
+            use_conversation_id = context_result["use_conversation_id"]
+            context_metadata = context_result["metadata"]
+
+            # Log context savings
+            logger.info(
+                f"Context mode: summary_window, "
+                f"tokens: {context_metadata.get('total_tokens', 0)} "
+                f"(summary={context_metadata.get('summary_tokens', 0)}, "
+                f"window={context_metadata.get('window_tokens', 0)})"
+            )
+        else:
+            # Full mode: let OpenAI handle context
+            input_data = base_input
+            use_conversation_id = True
+            context_metadata = {"mode": "full"}
+
+        # Build API request parameters
+        request_params = {
+            "model": CONFIG["model"],
+            "input": input_data,
+            "instructions": PROMPTS.get("system_prompt"),
+            "temperature": CONFIG.get("temperature", 1.0),
+            "max_output_tokens": CONFIG.get("max_tokens"),
+            "user": self.user_id,
+            "store": True  # Always store for history retrieval
+        }
+
+        # Only include conversation_id if using full mode
+        if use_conversation_id:
+            request_params["conversation_id"] = self.openai_conversation_id
+
+        # Make Responses API call
+        response = self._execute_with_retry(
+            self.client.create_response,
+            **request_params
+        )
+
+        # Extract response text using Responses API helper
+        output_text = extract_output_text(response)
         usage = self._extract_usage(response)
 
-        # Add assistant response to conversation history
-        self._add_assistant_message(output_text)
-
+        # Update conversation state
         self.message_count += 1
         self._update_conversation_count()
-        self._update_session_stats(usage)
+        self._update_usage_stats(usage)
 
         logger.debug(f"Chat completed - tokens: {usage}, cost: ${self._calculate_cost(usage):.6f}")
 
@@ -743,11 +829,21 @@ class ConversationManager:
             "cost": self._calculate_cost(usage),
             "user_id": self.user_id,
             "conversation_id": self.conversation_id,
-            "message_number": self.message_count
+            "openai_conversation_id": self.openai_conversation_id,
+            "message_number": self.message_count,
+            "context_mode": context_metadata.get("mode", "full"),
+            "context_tokens": context_metadata.get("total_tokens", usage.get("input", 0))
         }
 
     def chat_stream(self, message: str) -> dict:
-        """Send a chat message with streaming using OpenAI-compatible format."""
+        """
+        Send a chat message with streaming using ONLY OpenAI Responses API.
+        Uses streaming from Responses API with event types: response.output_text.delta
+
+        Context Management:
+        - mode="full": Uses conversation_id, OpenAI handles full history
+        - mode="summary_window": Manually builds [Summary] + [Window] context
+        """
         self._check_cost_limit()
         self._check_rate_limit()
 
@@ -763,50 +859,101 @@ class ConversationManager:
             logger.error(f"Input validation failed: {e}")
             raise
 
-        if not self.conversation_id:
-            self.create_conversation()
+        # Ensure conversation exists
+        self._ensure_conversation()
 
-        # Build messages array with any pending files
-        messages = self._build_messages(message)
+        # Build input with any pending files
+        base_input = self._build_input(message)
 
+        # Determine context strategy
+        use_summary_window = (
+            self.context_config.mode == "summary_window" and
+            self.message_count >= self.context_config.summarize_after_messages
+        )
+
+        context_metadata = {}
+
+        if use_summary_window:
+            # Summary + Window mode: manually build context
+            context_result = self.context_manager.build_context_for_api(
+                conversation_id=self.openai_conversation_id,
+                new_message=message if isinstance(base_input, str) else message,
+                system_prompt=PROMPTS.get("system_prompt"),
+                message_count=self.message_count
+            )
+
+            input_data = context_result["input"]
+            use_conversation_id = context_result["use_conversation_id"]
+            context_metadata = context_result["metadata"]
+
+            # Log context savings
+            logger.info(
+                f"Stream context mode: summary_window, "
+                f"tokens: {context_metadata.get('total_tokens', 0)}"
+            )
+        else:
+            # Full mode: let OpenAI handle context
+            input_data = base_input
+            use_conversation_id = True
+            context_metadata = {"mode": "full"}
+
+        # Update message count before streaming
         self.message_count += 1
         self._update_conversation_count()
 
-        # Make OpenAI-compatible streaming API call
+        # Build streaming request parameters
+        stream_params = {
+            "model": CONFIG["model"],
+            "input": input_data,
+            "instructions": PROMPTS.get("system_prompt"),
+            "temperature": CONFIG.get("temperature", 1.0),
+            "max_output_tokens": CONFIG.get("max_tokens"),
+            "user": self.user_id,
+            "store": True  # Store the response
+        }
+
+        # Only include conversation_id if using full mode
+        if use_conversation_id:
+            stream_params["conversation_id"] = self.openai_conversation_id
+
+        # Make Responses API streaming call
         stream = self._execute_with_retry(
-            self.client.chat.completions.create,
-            model=CONFIG["model"],
-            messages=messages,
-            temperature=CONFIG.get("temperature", 1.0),
-            max_tokens=CONFIG.get("max_tokens"),
-            user=self.user_id,
-            stream=True,
-            stream_options={"include_usage": True}
+            self.client.create_response_stream_raw,
+            **stream_params
         )
 
         text_parts = []
         usage = {"input": 0, "output": 0, "total": 0}
 
-        for chunk in stream:
-            # OpenAI-compatible streaming format
-            if chunk.choices and len(chunk.choices) > 0:
-                delta = chunk.choices[0].delta
-
-                # Handle content delta
-                if delta and delta.content:
-                    print(delta.content, end='', flush=True)
-                    text_parts.append(delta.content)
-
-            # Usage arrives in a final chunk (with include_usage=True)
-            if hasattr(chunk, 'usage') and chunk.usage:
-                usage = self._extract_usage(chunk)
+        # Process streaming events from Responses API
+        for event in stream:
+            # Responses API streaming event types
+            if hasattr(event, 'type'):
+                event_type = event.type
+                
+                # Handle text delta events
+                if event_type == 'response.output_text.delta':
+                    if hasattr(event, 'delta') and event.delta:
+                        print(event.delta, end='', flush=True)
+                        text_parts.append(event.delta)
+                
+                # Handle completed event for usage stats
+                elif event_type == 'response.completed':
+                    if hasattr(event, 'response') and event.response:
+                        usage = self._extract_usage(event.response)
+                        break
+            
+            # Alternative: handle direct text attributes
+            elif hasattr(event, 'delta') and event.delta:
+                delta_text = event.delta
+                if isinstance(delta_text, str):
+                    print(delta_text, end='', flush=True)
+                    text_parts.append(delta_text)
 
         full_text = "".join(text_parts)
-        
-        # Add assistant response to conversation history
-        self._add_assistant_message(full_text)
 
-        self._update_session_stats(usage)
+        # Update usage stats with actual usage from completed response
+        self._update_usage_stats(usage)
 
         logger.debug(f"Stream completed - tokens: {usage}, cost: ${self._calculate_cost(usage):.6f}")
 
@@ -816,7 +963,10 @@ class ConversationManager:
             "cost": self._calculate_cost(usage),
             "user_id": self.user_id,
             "conversation_id": self.conversation_id,
-            "message_number": self.message_count
+            "openai_conversation_id": self.openai_conversation_id,
+            "message_number": self.message_count,
+            "context_mode": context_metadata.get("mode", "full"),
+            "context_tokens": context_metadata.get("total_tokens", usage.get("input", 0))
         }
 
     def chat_with_image(self, message: str, image_path: str) -> dict:
@@ -827,28 +977,52 @@ class ConversationManager:
         return self.chat(message)
 
     def get_history(self) -> list:
-        """Get conversation history from local messages array."""
-        # Return messages in a user-friendly format
-        history = []
-        for msg in self.messages:
-            role = msg.get("role")
-            content = msg.get("content")
-            
-            # Handle different content types
-            if isinstance(content, list):
-                # Multimodal content - extract text parts
-                text_parts = []
-                for part in content:
-                    if part.get("type") == "text":
-                        text_parts.append(part.get("text", ""))
-                    elif part.get("type") == "image_url":
-                        text_parts.append("[Image]")
-                content = " ".join(text_parts)
-            
-            if role in ["user", "assistant"]:
-                history.append({"role": role, "content": content or ""})
+        """
+        Get conversation history from OpenAI API (NOT local storage).
+        Fetches from OpenAI: client.list_conversation_items(conversation_id)
+        """
+        if not self.openai_conversation_id:
+            return []
         
-        return history
+        try:
+            # Fetch conversation items from OpenAI Conversations API
+            items = self.client.list_conversation_items(
+                self.openai_conversation_id,
+                limit=CONFIG.get("max_history_items", 100),
+                order="asc"
+            )
+            
+            # Convert items to message format
+            history = []
+            for item in items.data if hasattr(items, 'data') else items:
+                role = getattr(item, 'role', None)
+                content = getattr(item, 'content', None)
+                
+                if role and content:
+                    # Handle different content types
+                    if isinstance(content, list):
+                        # Multimodal content - extract text parts
+                        text_parts = []
+                        for part in content:
+                            if isinstance(part, dict):
+                                if part.get("type") == "text":
+                                    text_parts.append(part.get("text", ""))
+                                elif part.get("type") == "image_url":
+                                    text_parts.append("[Image]")
+                        content_text = " ".join(text_parts)
+                    elif isinstance(content, str):
+                        content_text = content
+                    else:
+                        content_text = str(content)
+                    
+                    if role in ["user", "assistant"]:
+                        history.append({"role": role, "content": content_text or ""})
+            
+            return history
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch conversation history from OpenAI: {e}")
+            return []
 
     def list_saved_conversations(self) -> list:
         """List saved conversations."""
@@ -877,17 +1051,11 @@ class ConversationManager:
                 if conv_data and conv_data.get("user_id") == self.user_id:
                     self.conversation_id = conv_data["id"]
                     self.message_count = conv_data.get("message_count", 0)
+                    # Load OpenAI conversation ID from metadata
+                    metadata = conv_data.get("metadata", {})
+                    self.openai_conversation_id = metadata.get("openai_conversation_id")
 
-                    # Reset messages and rebuild from stored data if available
-                    self.messages = []
-                    system_prompt = PROMPTS.get("system_prompt")
-                    if system_prompt:
-                        self.messages.append({
-                            "role": "system",
-                            "content": system_prompt
-                        })
-
-                    logger.info(f"Loaded conversation: {self.conversation_id}")
+                    logger.info(f"Loaded conversation: {self.conversation_id} (OpenAI: {self.openai_conversation_id})")
                     return True
             else:
                 # Check in local conversations list (exact or partial)
@@ -896,17 +1064,9 @@ class ConversationManager:
                     conv = matches[0]
                     self.conversation_id = conv["id"]
                     self.message_count = conv.get("message_count", 0)
+                    self.openai_conversation_id = conv.get("openai_conversation_id")
 
-                    # Reset messages
-                    self.messages = []
-                    system_prompt = PROMPTS.get("system_prompt")
-                    if system_prompt:
-                        self.messages.append({
-                            "role": "system",
-                            "content": system_prompt
-                        })
-
-                    logger.info(f"Loaded conversation: {self.conversation_id}")
+                    logger.info(f"Loaded conversation: {self.conversation_id} (OpenAI: {self.openai_conversation_id})")
                     return True
                 elif len(matches) > 1:
                     logger.warning(f"Ambiguous conversation ID '{conv_id}', {len(matches)} matches")
@@ -951,10 +1111,11 @@ class ConversationManager:
             elif format == "json":
                 export_data = {
                     "conversation_id": self.conversation_id,
+                    "openai_conversation_id": self.openai_conversation_id,
                     "user_id": self.user_id,
                     "exported_at": datetime.now().isoformat(),
                     "messages": history,
-                    "api_version": "openai-compatible"
+                    "api_version": "responses-api"
                 }
                 with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
                     temp_fd = None
@@ -965,8 +1126,9 @@ class ConversationManager:
                     temp_fd = None
                     f.write(f"# Conversation Export\n\n")
                     f.write(f"- **ID:** {self.conversation_id}\n")
+                    f.write(f"- **OpenAI ID:** {self.openai_conversation_id}\n")
                     f.write(f"- **User:** {self.user_id}\n")
-                    f.write(f"- **API:** OpenAI-Compatible\n\n---\n\n")
+                    f.write(f"- **API:** OpenAI Responses API\n\n---\n\n")
                     for msg in history:
                         role = "**You**" if msg["role"] == "user" else "**AI**"
                         f.write(f"{role}:\n\n{msg['content']}\n\n---\n\n")
@@ -999,8 +1161,8 @@ class ConversationManager:
                 logger.error(f"Failed to get user stats: {e}")
         return {
             "total_conversations": len(self.conversations_list),
-            "session_tokens": self.session_tokens,
-            "session_cost": self.session_cost
+            "total_tokens": self.total_tokens,
+            "total_cost": self.total_cost
         }
 
 
@@ -1012,6 +1174,15 @@ def print_usage(result: dict):
     print(f"\n{'─' * 55}")
     if CONFIG["show_tokens"]:
         print(f"Tokens: {u.get('input', 0)} in | {u.get('output', 0)} out | {u.get('total', 0)} total")
+
+    # Show context mode info
+    context_mode = result.get("context_mode", "full")
+    context_tokens = result.get("context_tokens", 0)
+    if context_mode == "summary_window":
+        print(f"Context: summary_window ({context_tokens} tokens)")
+    else:
+        print(f"Context: full")
+
     if CONFIG["show_cost"]:
         print(f"Cost: ${cost:.6f}")
     print(f"User: {result['user_id']} | Conv: {result['conversation_id'][:16]}...")
@@ -1051,7 +1222,7 @@ def main():
     print("  /new              - New conversation")
     print("  /id               - Show IDs")
     print("  /history          - Show history")
-    print("  /tokens           - Show session usage")
+    print("  /tokens           - Show usage statistics")
     print("  /stats            - Show user statistics")
     print("  /upload PATH      - Upload file (image/doc)")
     print("  /image PATH MSG   - Send image with message")
@@ -1076,7 +1247,7 @@ def main():
     # Show storage status
     storage_type = "PostgreSQL" if (DATABASE_AVAILABLE and DATABASE_ENABLED and db) else "JSON files"
     print(f"\nStorage: {storage_type}")
-    print(f"API: OpenAI-Compatible /chat endpoint")
+    print(f"API: OpenAI Responses API (with Conversations API persistence)")
     print()
 
     manager = ConversationManager(user_id=user_id)
@@ -1096,7 +1267,7 @@ def main():
                 continue
 
             if user_input == "/quit":
-                print(f"\nSession: {manager.session_tokens}, Cost: ${manager.session_cost:.6f}")
+                print(f"\nTokens: {manager.total_tokens}, Cost: ${manager.total_cost:.6f}")
                 print("Goodbye!")
                 break
 
@@ -1107,12 +1278,13 @@ def main():
             elif user_input == "/id":
                 print(f"\nUser: {manager.user_id}")
                 print(f"Conv: {manager.conversation_id}")
+                print(f"OpenAI Conv: {manager.openai_conversation_id}")
                 print(f"Msgs: {manager.message_count}\n")
 
             elif user_input == "/tokens":
-                t = manager.session_tokens
+                t = manager.total_tokens
                 print(f"\nTokens: {t['input']:,} in | {t['output']:,} out | {t['total']:,} total")
-                print(f"Cost: ${manager.session_cost:.6f}\n")
+                print(f"Cost: ${manager.total_cost:.6f}\n")
 
             elif user_input == "/stats":
                 stats = manager.get_user_stats()
@@ -1220,7 +1392,7 @@ def main():
                 print_usage(result)
 
         except KeyboardInterrupt:
-            print(f"\n\nSession: {manager.session_tokens}, Cost: ${manager.session_cost:.6f}")
+            print(f"\n\nTokens: {manager.total_tokens}, Cost: ${manager.total_cost:.6f}")
             print("Goodbye!")
             break
         except CostLimitExceededError as e:

@@ -1,306 +1,299 @@
-# 🤖 TextLLM - OpenAI-Compatible Chat API
+# LLM Chat API
 
-> **Version:** 2.0.0  
-> **Base URL:** `http://localhost:8000`  
-> **Interactive Docs:** `http://localhost:8000/docs`
+REST API for conversational AI using OpenAI's Responses API with PostgreSQL metadata storage.
 
-A production-ready conversational AI backend with **OpenAI-compatible API**, supporting multimodal inputs (text, images, documents), streaming, and enterprise features.
+**Base URL:** `http://localhost:8000`
+**Docs:** `http://localhost:8000/docs`
 
----
-
-## ✨ Features
-
-| Feature | Description |
-|---------|-------------|
-| **OpenAI-Compatible API** | Drop-in replacement for OpenAI's `/v1/chat/completions` |
-| **Unified Endpoint** | Single `/chat` endpoint for text, images, files, and streaming |
-| **Multimodal Support** | Text, images (GPT-4 Vision), PDF, DOCX, TXT processing |
-| **Streaming** | Server-Sent Events (SSE) compatible with OpenAI format |
-| **Enterprise Storage** | PostgreSQL + S3 for persistence |
-| **Rate Limiting** | Token bucket per user |
-| **Cost Tracking** | Real-time token usage and cost calculation |
-
----
-
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
-# Install dependencies
+# Install
 pip install -r requirements.txt
 
 # Configure
-cp .env.example .env
-# Edit .env: OPENAI_API_KEY=sk-your-key-here
+export OPENAI_API_KEY=sk-your-key
+export DATABASE_URL=postgresql://user:pass@host:5432/db
+export DATABASE_ENABLED=true
 
-# Run server
+# Run
 python server.py
 ```
 
-Server runs at: `http://localhost:8000`
+## API Endpoints
 
----
+### Chat
 
-## 📡 API Endpoints (18 Total)
+#### POST /chat
+Send a message and get a response.
 
-### 🌟 Main Endpoint
+**Request:**
+```json
+{
+  "input": "Hello, how are you?",
+  "user_id": "user123",
+  "conversation_id": "conv_xxx",
+  "model": "gpt-4o",
+  "stream": false,
+  "temperature": 1.0,
+  "max_tokens": 1000
+}
+```
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/chat` | **Unified chat** - text, images, files, streaming |
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| input | string | Yes | User message |
+| user_id | string | No | User identifier for rate limiting |
+| conversation_id | string | No | Existing conversation ID (auto-creates if omitted) |
+| model | string | No | Model to use (default: gpt-4o) |
+| stream | boolean | No | Enable streaming (default: false) |
+| temperature | float | No | Sampling temperature 0-2 (default: 1.0) |
+| max_tokens | int | No | Max output tokens |
 
-**Example:**
+**Response:**
+```json
+{
+  "id": "resp_xxx",
+  "object": "response",
+  "created_at": 1234567890,
+  "model": "gpt-4o",
+  "output_text": "Hello! I'm doing well, thank you for asking.",
+  "conversation_id": "conv_xxx",
+  "title": "Friendly Greeting",
+  "message_count": 1,
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 15,
+    "total_tokens": 25
+  },
+  "cost": 0.0002
+}
+```
+
+**Streaming:**
 ```bash
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4o",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
+  -d '{"input": "Hello", "stream": true}'
 ```
-
-### Conversation Management
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/conversations` | Create conversation |
-| `GET` | `/conversations` | List conversations |
-| `GET` | `/conversations/{id}` | Get conversation |
-| `DELETE` | `/conversations/{id}` | Delete conversation |
-| `GET` | `/conversations/{id}/messages` | Get messages |
-
-### User & Sessions
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/users/{id}/stats` | User statistics |
-| `GET` | `/sessions/{id}` | Get session |
-| `GET` | `/users/{id}/sessions` | List sessions |
-| `POST` | `/sessions/{id}/end` | End session |
-
-### Files
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/files/upload` | Upload file |
-| `GET` | `/files` | List files |
-| `DELETE` | `/files/{key}` | Delete file |
-
-### Health & Config
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/health` | Health check |
-| `GET` | `/health/live` | Liveness probe |
-| `GET` | `/health/ready` | Readiness probe |
-| `GET` | `/config` | Configuration |
-| `GET` | `/` | API info |
-| `GET` | `/docs` | Swagger UI |
+Returns Server-Sent Events (SSE).
 
 ---
 
-## 🔥 Detailed API Usage
+### Conversations
 
-### Unified Chat Endpoint (`POST /chat`)
+#### POST /conversations
+Create a new conversation.
 
-#### Text Chat
+**Request:**
 ```json
 {
-  "model": "gpt-4o",
-  "messages": [
-    {"role": "system", "content": "You are helpful."},
-    {"role": "user", "content": "Hello!"}
-  ],
-  "stream": false,
-  "temperature": 1.0
+  "user_id": "user123",
+  "title": "My Chat"
 }
 ```
 
-#### With Image (Multimodal)
+**Response:**
 ```json
 {
-  "model": "gpt-4o",
-  "messages": [{
+  "id": "conv_xxx",
+  "user_id": "user123",
+  "created_at": "2025-01-01T00:00:00",
+  "message_count": 0,
+  "title": "My Chat",
+  "summary": null,
+  "total_tokens": 0,
+  "total_cost": 0
+}
+```
+
+#### GET /conversations?user_id=xxx
+List conversations for a user.
+
+**Query Parameters:**
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| user_id | string | Required | User ID |
+| limit | int | 50 | Max results (1-100) |
+| offset | int | 0 | Pagination offset |
+
+#### GET /conversations/{id}
+Get a single conversation.
+
+**Response:**
+```json
+{
+  "id": "conv_xxx",
+  "user_id": "user123",
+  "created_at": "2025-01-01T00:00:00",
+  "message_count": 15,
+  "title": "Python Learning",
+  "summary": "User is learning Python basics including variables, data types, and functions.",
+  "total_tokens": 5000,
+  "total_cost": 0.015
+}
+```
+
+#### PATCH /conversations/{id}
+Update conversation title or metadata.
+
+**Request:**
+```json
+{
+  "title": "New Title"
+}
+```
+
+#### DELETE /conversations/{id}
+Delete a conversation.
+
+**Query Parameters:**
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| soft | boolean | true | Soft delete (keeps data) |
+
+#### GET /conversations/{id}/messages
+Get messages from OpenAI's Conversations API.
+
+**Response:**
+```json
+[
+  {
+    "id": "msg_xxx",
     "role": "user",
-    "content": [
-      {"type": "text", "text": "What's this?"},
-      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
-    ]
-  }]
-}
-```
-
-#### File Upload (Multipart)
-```bash
-curl -X POST http://localhost:8000/chat \
-  -F "messages=[{\"role\":\"user\",\"content\":\"Summarize\"}]" \
-  -F "files=@document.pdf"
-```
-
-#### Response Format (OpenAI-Compatible)
-```json
-{
-  "id": "chatcmpl-abc123",
-  "object": "chat.completion",
-  "created": 1677652288,
-  "model": "gpt-4o",
-  "choices": [{
-    "index": 0,
-    "message": {
-      "role": "assistant",
-      "content": "Hello! How can I help?"
-    },
-    "finish_reason": "stop"
-  }],
-  "usage": {
-    "prompt_tokens": 12,
-    "completion_tokens": 8,
-    "total_tokens": 20
+    "content": "What is Python?",
+    "created_at": "2025-01-01T00:00:00"
   },
-  "conversation_id": "conv_abc123",
-  "cost": 0.0001
-}
+  {
+    "id": "msg_yyy",
+    "role": "assistant",
+    "content": "Python is a programming language...",
+    "created_at": "2025-01-01T00:00:01"
+  }
+]
 ```
 
 ---
 
-## 🗄️ Database Schema (PostgreSQL)
+### Health & Info
 
-### Table 1: `conversations`
+#### GET /health
+Health check with system status.
+
+#### GET /config
+Current configuration (non-sensitive).
+
+#### GET /
+API information.
+
+---
+
+## Features
+
+### Auto Title Generation
+When you send the first message to a conversation without a title, an AI-generated title is created automatically using gpt-4o-mini.
+
+### Conversation Summary
+Long conversations are automatically summarized to reduce token usage. The summary is stored and updated every 5 new messages after the threshold is reached.
+
+### Message Storage
+Messages are stored in OpenAI's Conversations API, not locally. The local database stores only metadata:
+- Title and summary
+- Message count
+- Token usage and cost
+- Timestamps
+
+---
+
+## Configuration
+
+### Environment Variables
+```bash
+OPENAI_API_KEY=sk-xxx          # Required
+DATABASE_URL=postgresql://...   # Required for persistence
+DATABASE_ENABLED=true           # Enable database
+S3_ENABLED=true                 # Enable S3 storage
+S3_ENDPOINT=https://...
+S3_ACCESS_KEY=xxx
+S3_SECRET_KEY=xxx
+S3_BUCKET=bucket-name
+```
+
+### config.yaml
+```yaml
+model: gpt-4o
+rate_limit_per_minute: 10
+max_input_length: 10000
+
+context_management:
+  mode: summary_window    # "full" or "summary_window"
+  window_size: 5          # Message pairs to keep
+  summarize_after_messages: 10
+  summary_update_interval: 5
+
+pricing:
+  input_per_1k: 0.0025
+  output_per_1k: 0.01
+```
+
+---
+
+## Database Schema
 
 ```sql
 CREATE TABLE conversations (
     id VARCHAR(255) PRIMARY KEY,
     user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    title VARCHAR(500),
+    summary TEXT,
     message_count INTEGER DEFAULT 0,
+    summary_message_count INTEGER DEFAULT 0,
+    summary_updated_at TIMESTAMP,
     total_tokens_input INTEGER DEFAULT 0,
     total_tokens_output INTEGER DEFAULT 0,
     total_cost DECIMAL(10, 6) DEFAULT 0,
-    image_urls TEXT[] DEFAULT '{}',
-    tags TEXT[] DEFAULT '{}',
-    title VARCHAR(500),
-    summary TEXT,
-    metadata JSONB DEFAULT '{}'::jsonb,
-    is_deleted BOOLEAN DEFAULT FALSE
-);
-```
-
-### Table 2: `sessions`
-
-```sql
-CREATE TABLE sessions (
-    id VARCHAR(255) PRIMARY KEY,
-    user_id VARCHAR(255) NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    total_tokens INTEGER DEFAULT 0,
-    total_cost DECIMAL(10, 6) DEFAULT 0,
-    conversation_count INTEGER DEFAULT 0,
-    is_active BOOLEAN DEFAULT TRUE
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    metadata JSONB DEFAULT '{}'::jsonb
 );
 ```
 
-### Indexes
-```sql
-CREATE INDEX idx_conversations_user_id ON conversations(user_id);
-CREATE INDEX idx_conversations_last_used ON conversations(last_used DESC);
-CREATE INDEX idx_sessions_user_id ON sessions(user_id);
-```
-
 ---
 
-## 🧪 Testing
+## Examples
 
+### Basic Chat
 ```bash
-# Quick test
-python tests_standalone/manual_test.py
-
-# All tests
-python tests_standalone/manual_test.py --all
-
-# Pytest
-pip install pytest fastapi httpx
-python tests_standalone/run_tests.py -v
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"input": "What is Python?", "user_id": "user1"}'
 ```
 
----
-
-## 📁 Project Structure
-
-```
-LLM_Wrapper/
-├── server.py              # FastAPI server
-├── terminal_chatbot.py    # CLI client
-├── database.py            # PostgreSQL operations
-├── storage.py             # S3 operations
-├── validators.py          # Input validation
-├── exceptions.py          # Custom exceptions
-├── config.yaml            # Configuration
-├── requirements.txt       # Dependencies
-├── tests_standalone/      # Test suite
-│   ├── manual_test.py
-│   ├── run_tests.py
-│   └── README.md
-└── README.md              # This file
-```
-
----
-
-## ⚙️ Configuration
-
-### Environment Variables
-
+### Continue Conversation
 ```bash
-# Required
-OPENAI_API_KEY=sk-your-key-here
-
-# Database (optional)
-DATABASE_ENABLED=true
-DATABASE_URL=postgresql://user:pass@host:5432/dbname
-
-# S3 Storage (optional)
-S3_ENABLED=true
-S3_ENDPOINT=https://s3.amazonaws.com
-S3_ACCESS_KEY=your-access-key
-S3_SECRET_KEY=your-secret-key
-S3_BUCKET=your-bucket
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "Tell me more about lists",
+    "user_id": "user1",
+    "conversation_id": "conv_xxx"
+  }'
 ```
 
-### config.yaml
-
-```yaml
-model: gpt-4o
-rate_limit_per_minute: 10
-max_input_length: 10000
-max_file_size_mb: 20
-pricing:
-  input_per_1k: 0.0025
-  output_per_1k: 0.01
-stream_responses: true
+### List User Conversations
+```bash
+curl "http://localhost:8000/conversations?user_id=user1"
 ```
 
----
-
-## 🐳 Docker
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
-EXPOSE 8000
-CMD ["gunicorn", "server:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000"]
+### Get Conversation with Summary
+```bash
+curl http://localhost:8000/conversations/conv_xxx
 ```
 
----
-
-## 📄 License
-
-MIT License
-
----
-
-**Built with ❤️ using FastAPI + OpenAI**
+### Update Title
+```bash
+curl -X PATCH http://localhost:8000/conversations/conv_xxx \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Python Tutorial"}'
+```

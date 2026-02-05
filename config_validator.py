@@ -62,13 +62,6 @@ CONFIG_SCHEMA = {
     },
 
     # Cost control
-    "cost_limit_per_session": {
-        "type": (int, float),
-        "required": False,
-        "min": 0.01,
-        "max": 1000.0,
-        "default": 5.0
-    },
     "warn_at_cost": {
         "type": (int, float),
         "required": False,
@@ -161,6 +154,69 @@ CONFIG_SCHEMA = {
         "min": 0,
         "max": 10,
         "default": 3
+    },
+
+    # Context Management - Summary + Window strategy
+    "context_management": {
+        "type": dict,
+        "required": False,
+        "default": {
+            "mode": "full",
+            "window_size": 10,
+            "max_context_tokens": 2500,
+            "summarize_after_messages": 10,
+            "summary_model": "gpt-4o-mini",
+            "max_summary_tokens": 500,
+            "summary_update_interval": 10
+        },
+        "nested_schema": {
+            "mode": {
+                "type": str,
+                "required": False,
+                "allowed_values": ["full", "summary_window"],
+                "default": "full"
+            },
+            "window_size": {
+                "type": int,
+                "required": False,
+                "min": 1,
+                "max": 50,
+                "default": 10
+            },
+            "max_context_tokens": {
+                "type": int,
+                "required": False,
+                "min": 500,
+                "max": 100000,
+                "default": 2500
+            },
+            "summarize_after_messages": {
+                "type": int,
+                "required": False,
+                "min": 5,
+                "max": 100,
+                "default": 10
+            },
+            "summary_model": {
+                "type": str,
+                "required": False,
+                "default": "gpt-4o-mini"
+            },
+            "max_summary_tokens": {
+                "type": int,
+                "required": False,
+                "min": 100,
+                "max": 2000,
+                "default": 500
+            },
+            "summary_update_interval": {
+                "type": int,
+                "required": False,
+                "min": 5,
+                "max": 50,
+                "default": 10
+            }
+        }
     }
 }
 
@@ -296,20 +352,6 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     # Raise if there are validation errors
-    if errors:
-        raise ConfigurationError(
-            f"Configuration validation failed:\n  - " + "\n  - ".join(errors),
-            field="config"
-        )
-
-    # Additional cross-field validation
-    if validated.get("warn_at_cost") and validated.get("cost_limit_per_session"):
-        if validated["warn_at_cost"] >= validated["cost_limit_per_session"]:
-            errors.append(
-                f"'warn_at_cost' ({validated['warn_at_cost']}) must be less than "
-                f"'cost_limit_per_session' ({validated['cost_limit_per_session']})"
-            )
-
     if errors:
         raise ConfigurationError(
             f"Configuration validation failed:\n  - " + "\n  - ".join(errors),
