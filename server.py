@@ -450,6 +450,7 @@ def build_input_content(input_data: Union[str, List[MessageContent]]) -> Union[s
         if item.type == "text" and item.text:
             content_list.append({"type": "input_text", "text": item.text})
         elif item.type == "image_url" and item.image_url:
+            # OpenAI Responses API format: {"type": "input_image", "image_url": "..."}
             content_list.append({
                 "type": "input_image",
                 "image_url": item.image_url.get("url", "")
@@ -613,10 +614,24 @@ async def chat(
     message_count = 0
     conv_data = None
     is_new_conversation = request.conversation_id is None
+    conversation_id = request.conversation_id
 
-    if db and request.conversation_id:
+    # Auto-create conversation if none provided
+    if is_new_conversation:
         try:
-            conv_data = db.get_conversation(request.conversation_id)
+            # Create new conversation in OpenAI
+            new_conv = client.create_conversation(
+                metadata={"user_id": user_id}
+            )
+            conversation_id = new_conv.id
+            logger.info(f"Auto-created conversation: {conversation_id}")
+        except Exception as e:
+            logger.error(f"Failed to create conversation: {e}")
+            # Continue without conversation - will work but no persistence
+
+    if db and conversation_id:
+        try:
+            conv_data = db.get_conversation(conversation_id)
             if conv_data:
                 message_count = conv_data.get("message_count", 0) or 0
         except Exception:
@@ -626,7 +641,7 @@ async def chat(
     use_summary_window = (
         context_config and
         context_config.mode == "summary_window" and
-        request.conversation_id and
+        conversation_id and
         message_count >= context_config.summarize_after_messages
     )
 
@@ -642,7 +657,7 @@ async def chat(
         # Summary + Window mode: manually build context
         try:
             context_result = context_manager.build_context_for_api(
-                conversation_id=request.conversation_id,
+                conversation_id=conversation_id,
                 new_message=sanitized_input if isinstance(sanitized_input, str) else str(sanitized_input),
                 system_prompt=request.instructions or PROMPTS.get("system_prompt"),
                 message_count=message_count
@@ -660,13 +675,13 @@ async def chat(
         except Exception as e:
             logger.warning(f"Context manager failed, falling back to full mode: {e}")
             params["input"] = input_content
-            if request.conversation_id:
-                params["conversation_id"] = request.conversation_id
+            if conversation_id:
+                params["conversation_id"] = conversation_id
     else:
         # Full mode: let OpenAI handle context
         params["input"] = input_content
-        if request.conversation_id:
-            params["conversation_id"] = request.conversation_id
+        if conversation_id:
+            params["conversation_id"] = conversation_id
 
     if request.instructions:
         params["instructions"] = request.instructions
@@ -693,7 +708,7 @@ async def chat(
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "X-Conversation-ID": request.conversation_id or "",
+                "X-Conversation-ID": conversation_id or "",
                 "X-Context-Mode": context_metadata.get("mode", "full")
             }
         )
@@ -745,8 +760,10 @@ async def chat(
     # Extract text for convenience
     output_text = extract_output_text(response)
     
-    # Get conversation ID from response if available
-    conversation_id = getattr(response, "conversation_id", None) or request.conversation_id
+    # Get conversation ID from response if available, otherwise use the one we created/received
+    response_conv_id = getattr(response, "conversation_id", None)
+    if response_conv_id:
+        conversation_id = response_conv_id
 
     # Track title for response
     title = None
@@ -850,8 +867,12 @@ async def stream_chat_response(
                     yield f"data: {json.dumps(chunk)}\n\n"
                     
             elif event_type == "response.output_item.added":
-                # New output item
+                # New output item - convert to dict if needed
                 item = getattr(event, "item", {})
+                if hasattr(item, "model_dump"):
+                    item = item.model_dump()
+                elif hasattr(item, "__dict__"):
+                    item = {"type": getattr(item, "type", "unknown")}
                 chunk = {
                     "id": response_id,
                     "object": "response.chunk",

@@ -132,17 +132,23 @@ class Database:
     def _run_migrations(self):
         """Create tables for conversation metadata (NOT message content)."""
         with self.get_cursor() as cursor:
+            # Create schema if it doesn't exist
+            cursor.execute("CREATE SCHEMA IF NOT EXISTS textllm")
+
+            # Set search path to use textllm schema
+            cursor.execute("SET search_path TO textllm, public")
+
             # Check if old schema exists and migrate
             cursor.execute("""
                 SELECT column_name FROM information_schema.columns
-                WHERE table_name = 'conversations'
+                WHERE table_schema = 'textllm' AND table_name = 'conversations'
             """)
             existing_columns = {row['column_name'] for row in cursor.fetchall()}
 
             if not existing_columns:
                 # Fresh install - create new schema
                 cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS conversations (
+                    CREATE TABLE IF NOT EXISTS textllm.conversations (
                         id VARCHAR(255) PRIMARY KEY,
                         user_id VARCHAR(255) NOT NULL,
                         title VARCHAR(500),
@@ -163,36 +169,36 @@ class Database:
                 # Existing table - apply migrations
                 # Add new columns if they don't exist
                 if 'title' not in existing_columns:
-                    cursor.execute("ALTER TABLE conversations ADD COLUMN title VARCHAR(500)")
+                    cursor.execute("ALTER TABLE textllm.conversations ADD COLUMN title VARCHAR(500)")
                     logger.info("Added 'title' column")
 
                 if 'summary' not in existing_columns:
-                    cursor.execute("ALTER TABLE conversations ADD COLUMN summary TEXT")
+                    cursor.execute("ALTER TABLE textllm.conversations ADD COLUMN summary TEXT")
                     logger.info("Added 'summary' column")
 
                 if 'message_count' not in existing_columns:
-                    cursor.execute("ALTER TABLE conversations ADD COLUMN message_count INTEGER DEFAULT 0")
+                    cursor.execute("ALTER TABLE textllm.conversations ADD COLUMN message_count INTEGER DEFAULT 0")
                     logger.info("Added 'message_count' column")
 
                 if 'summary_message_count' not in existing_columns:
-                    cursor.execute("ALTER TABLE conversations ADD COLUMN summary_message_count INTEGER DEFAULT 0")
+                    cursor.execute("ALTER TABLE textllm.conversations ADD COLUMN summary_message_count INTEGER DEFAULT 0")
                     logger.info("Added 'summary_message_count' column")
 
                 if 'summary_updated_at' not in existing_columns:
-                    cursor.execute("ALTER TABLE conversations ADD COLUMN summary_updated_at TIMESTAMP")
+                    cursor.execute("ALTER TABLE textllm.conversations ADD COLUMN summary_updated_at TIMESTAMP")
                     logger.info("Added 'summary_updated_at' column")
 
                 # Rename last_used to updated_at if needed
                 if 'last_used' in existing_columns and 'updated_at' not in existing_columns:
-                    cursor.execute("ALTER TABLE conversations RENAME COLUMN last_used TO updated_at")
+                    cursor.execute("ALTER TABLE textllm.conversations RENAME COLUMN last_used TO updated_at")
                     logger.info("Renamed 'last_used' to 'updated_at'")
                 elif 'updated_at' not in existing_columns:
-                    cursor.execute("ALTER TABLE conversations ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+                    cursor.execute("ALTER TABLE textllm.conversations ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
                     logger.info("Added 'updated_at' column")
 
                 # Migrate existing summary from metadata to dedicated column
                 cursor.execute("""
-                    UPDATE conversations
+                    UPDATE textllm.conversations
                     SET summary = metadata->'context_summary'->>'summary',
                         summary_message_count = COALESCE((metadata->'context_summary'->>'message_count')::INTEGER, 0)
                     WHERE metadata->'context_summary' IS NOT NULL
@@ -201,24 +207,24 @@ class Database:
 
                 # Drop redundant openai_conversation_id column if it exists
                 if 'openai_conversation_id' in existing_columns:
-                    cursor.execute("ALTER TABLE conversations DROP COLUMN IF EXISTS openai_conversation_id")
+                    cursor.execute("ALTER TABLE textllm.conversations DROP COLUMN IF EXISTS openai_conversation_id")
                     logger.info("Dropped redundant 'openai_conversation_id' column")
 
             # Create/update indexes
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_conversations_user_id
-                ON conversations(user_id)
+                ON textllm.conversations(user_id)
             """)
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_conversations_updated_at
-                ON conversations(updated_at DESC)
+                ON textllm.conversations(updated_at DESC)
             """)
             # Drop old index if exists
             cursor.execute("""
-                DROP INDEX IF EXISTS idx_conversations_openai_id
+                DROP INDEX IF EXISTS textllm.idx_conversations_openai_id
             """)
             cursor.execute("""
-                DROP INDEX IF EXISTS idx_conversations_last_used
+                DROP INDEX IF EXISTS textllm.idx_conversations_last_used
             """)
             logger.info("Database migrations completed")
 
@@ -247,7 +253,7 @@ class Database:
         """
         with self.get_cursor() as cursor:
             cursor.execute("""
-                INSERT INTO conversations (id, user_id, title, metadata)
+                INSERT INTO textllm.conversations (id, user_id, title, metadata)
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     updated_at = CURRENT_TIMESTAMP,
@@ -266,7 +272,7 @@ class Database:
                        summary_message_count, summary_updated_at,
                        total_tokens_input, total_tokens_output, total_cost,
                        created_at, updated_at, metadata, is_deleted
-                FROM conversations
+                FROM textllm.conversations
                 WHERE id = %s AND is_deleted = FALSE
             """, (conversation_id,))
             result = cursor.fetchone()
@@ -288,7 +294,7 @@ class Database:
                 SELECT id, user_id, title, summary, message_count,
                        total_tokens_input, total_tokens_output, total_cost,
                        created_at, updated_at, metadata
-                FROM conversations
+                FROM textllm.conversations
                 WHERE user_id = %s AND is_deleted = FALSE
                 ORDER BY updated_at DESC
                 LIMIT %s OFFSET %s
@@ -332,7 +338,7 @@ class Database:
             params.append(conversation_id)
 
             cursor.execute(f"""
-                UPDATE conversations
+                UPDATE textllm.conversations
                 SET {', '.join(updates)}
                 WHERE id = %s AND is_deleted = FALSE
                 RETURNING id
@@ -345,12 +351,12 @@ class Database:
         with self.get_cursor() as cursor:
             if soft:
                 cursor.execute("""
-                    UPDATE conversations SET is_deleted = TRUE
+                    UPDATE textllm.conversations SET is_deleted = TRUE
                     WHERE id = %s
                 """, (conversation_id,))
             else:
                 cursor.execute("""
-                    DELETE FROM conversations
+                    DELETE FROM textllm.conversations
                     WHERE id = %s
                 """, (conversation_id,))
             logger.info(f"Deleted conversation: {conversation_id}")
@@ -385,7 +391,7 @@ class Database:
         with self.get_cursor() as cursor:
             message_increment = "message_count = message_count + 1," if increment_message_count else ""
             cursor.execute(f"""
-                UPDATE conversations
+                UPDATE textllm.conversations
                 SET updated_at = CURRENT_TIMESTAMP,
                     {message_increment}
                     total_tokens_input = total_tokens_input + %s,
@@ -425,7 +431,7 @@ class Database:
         """
         with self.get_cursor() as cursor:
             cursor.execute("""
-                UPDATE conversations
+                UPDATE textllm.conversations
                 SET summary = %s,
                     summary_message_count = %s,
                     summary_updated_at = CURRENT_TIMESTAMP,
@@ -449,7 +455,7 @@ class Database:
         with self.get_cursor() as cursor:
             cursor.execute("""
                 SELECT summary, summary_message_count as message_count, summary_updated_at as updated_at
-                FROM conversations
+                FROM textllm.conversations
                 WHERE id = %s AND is_deleted = FALSE
             """, (conversation_id,))
             result = cursor.fetchone()
@@ -470,7 +476,7 @@ class Database:
         """
         with self.get_cursor() as cursor:
             cursor.execute("""
-                UPDATE conversations
+                UPDATE textllm.conversations
                 SET title = %s, updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s AND is_deleted = FALSE
                 RETURNING id
@@ -495,7 +501,7 @@ class Database:
         with self.get_cursor() as cursor:
             cursor.execute("""
                 SELECT message_count, summary_message_count
-                FROM conversations
+                FROM textllm.conversations
                 WHERE id = %s AND is_deleted = FALSE
             """, (conversation_id,))
             result = cursor.fetchone()
@@ -528,7 +534,7 @@ class Database:
                     COALESCE(SUM(total_tokens_output), 0) as total_tokens_output,
                     COALESCE(SUM(total_cost), 0) as total_cost,
                     COALESCE(SUM(message_count), 0) as total_messages
-                FROM conversations
+                FROM textllm.conversations
                 WHERE user_id = %s
                 AND created_at > CURRENT_TIMESTAMP - INTERVAL '%s days'
                 AND is_deleted = FALSE
@@ -544,7 +550,7 @@ class Database:
         try:
             with self.get_cursor() as cursor:
                 cursor.execute("SELECT 1")
-                cursor.execute("SELECT COUNT(*) as count FROM conversations")
+                cursor.execute("SELECT COUNT(*) as count FROM textllm.conversations")
                 conv_count = cursor.fetchone()['count']
             return {
                 "status": "healthy",
